@@ -242,6 +242,12 @@ contradicted it. They are here because each cost real time on the first pass (20
   directory under `$HOME`** (e.g. `~/qa-scratch`), and prove the mount before trusting the result:
   `docker run --rm -v "$PWD":/work --entrypoint="" <img> sh -c 'ls -a /work'`. A uniform failure
   across every case is a harness bug until proven otherwise.
+- **Never conclude from a truncated response.** Pass 8 nearly filed `cxpak_review op=review` as a
+  silent-wrong-answer defect: every array was empty against a repo that plainly had changes. They
+  were empty *correctly* — that op compares against a prior context snapshot, not git — and the
+  `recommendation` field in the same response said so. The probe printed the first 95 characters
+  and cut it off. When a response looks wrong, print the WHOLE thing before believing it; the field
+  that exonerates the code is often the one just past your `head -c`.
 - **macOS ships bash 3.2.** No associative arrays — `declare -A` fails with `invalid option`,
   and under `set -u` the next line dies with `unbound variable`. The supported platform is macOS,
   so anything in `qa/` has to run on 3.2.
