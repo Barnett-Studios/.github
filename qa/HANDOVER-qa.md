@@ -88,7 +88,7 @@ gating every pass on it would train the loop to ignore its own red.
 
 ## Each pass
 
-1. **Ghost check.** Above. Both halves.
+1. **Ghost check.** Above. All four halves — `--boot` included.
 2. **Re-test any silent-failure fix that reached a release since your last pass** — verbatim repro,
    assert the consequence and not the indicator. This is the one thing nothing else in the factory
    can do: CI cannot catch a wrong fix to a silent defect, because a green suite is what the defect
