@@ -46,18 +46,31 @@ Explicitly **out of scope**: `PixCrunch`, `mfx-starter`, `mticky`, `homebrew-tap
 qa/ghost-check.sh --boot      # in a clone of Barnett-Studios/.github
 ```
 
-**Two halves, both required, and the second is the one that was missing by default.**
+**Four halves, in increasing order of strength.**
 
-1. **Agreement** — is the published artifact the version `main` says it is? Release tag, newest
-   published image tag, and `latest` all agree.
-2. **Boot** — does a clean *anonymous* consumer actually receive that artifact and can they run it?
+1. **Provenance** — `:latest`'s `org.opencontainers.image.revision` is exactly the commit its own
+   version tag points at, and that commit is an ancestor of `main`.
+2. **Reach** — `latest` resolves to the same *digest* as the newest semver tag, anonymously.
+3. **Crate** — for the six crates.io members, the published max version equals the newest tag and
+   nothing in the line is yanked.
+4. **Boot** — (`--boot`) the image actually executes.
 
-Half 1 alone is the wrong check for the defect class it exists for. Every version can agree while
-`docker pull ghcr.io/barnett-studios/<x>` — which resolves `latest` — hands the consumer a
-months-old image. Agreement says nothing about what an outsider receives. This is the family
-analogue of Scriptorium's stale-service-worker defect, and it is why the check compares the
-**digest** of `latest` against the digest of the newest semver tag rather than comparing version
-strings, which would agree while pointing at different bytes.
+**Halves 2–4 all compare one published thing to another published thing.** They can be green
+together while the image was built from the wrong source; only half 1 can see that. This is not
+theoretical — mutating the recorded revision turns half 1 red on all eight components while halves
+2–4 stay green throughout.
+
+Half 2 exists because a consumer runs `docker pull`, which resolves `latest`. If it lags they
+silently receive old code while every version *string* still agrees, which is why the comparison is
+on **digests**, not names.
+
+**Scriptorium's anchor does not port, and this is the trap worth naming.** There, half 1 compares
+the deployed SHA against `git ls-remote origin main`, because Scriptorium continuously deploys
+`main`. This family ships **releases**, so `main` running ahead of the newest tag is the normal
+state *between* releases — measured 2026-08-14, it is +2 to +15 commits on all nine repos. Gating
+on it would fire everywhere, every pass, forever, and the loop would learn to ignore its own red.
+The reference here is the **tag**; `main`-lag is advisory context only. Do not "fix" this by
+re-adding a main-vs-published gate.
 
 The check runs **anonymously on purpose**. A token with `read:packages` would exercise a path no
 consumer walks, and would go green against an image that had silently become private.
@@ -206,6 +219,11 @@ contradicted it. They are here because each cost real time on the first pass (20
   manufactures a mismatch out of nothing. Check `.crate.repository` before believing a version.
 - **`gh <cmd> --json` returns empty here** under the rtk hook. Verify through `gh api`. An empty
   result read as "no labels exist" is a silent false negative.
+- **macOS ships bash 3.2.** No associative arrays — `declare -A` fails with `invalid option`,
+  and under `set -u` the next line dies with `unbound variable`. The supported platform is macOS,
+  so anything in `qa/` has to run on 3.2.
+- **`echo "exit=$?"` after a pipe reads the last command in the pipe**, not your script. Redirect
+  to a file and check the exit code on its own line, or you will report a passing run of `tail`.
 - **Read the README before calling it broken.** `docker run cordon:latest --help` fails with
   rc=127, and cordon's README explicitly documents that image as *not* the sandbox — the swappable
   `<runtime>` argument, no entrypoint by design. The disclaimer was three paragraphs above the
