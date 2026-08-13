@@ -219,6 +219,20 @@ contradicted it. They are here because each cost real time on the first pass (20
   manufactures a mismatch out of nothing. Check `.crate.repository` before believing a version.
 - **`gh <cmd> --json` returns empty here** under the rtk hook. Verify through `gh api`. An empty
   result read as "no labels exist" is a silent false negative.
+- **Run `cosign` inside a container, not on the host.** This QA host's sandbox blocks Go's direct
+  DNS/TCP to `tuf-repo-cdn.sigstore.dev` while `curl` reaches it in 0.4s, so host `cosign` dies with
+  an `i/o timeout` fetching rekor/ctlog keys — which reads like a broken signature and is not one.
+  This works:
+  ```sh
+  docker run --rm -v "$PWD":/w -w /w --entrypoint=cosign gcr.io/projectsigstore/cosign:v2.6.4 \
+    verify-blob <file> --signature <file>.sig --certificate <file>.pem \
+    --certificate-identity-regexp '^https://github\.com/Barnett-Studios/<repo>/' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  ```
+- **A `.pem` release asset that `openssl x509` cannot parse is NOT a defect.** `cosign sign-blob
+  --output-certificate` writes the certificate base64-encoded, and `verify-blob --certificate`
+  reads that form back. `base64 -d < x.pem | openssl x509 -noout -issuer` shows the real cert.
+  Filing this would be noise.
 - **A bind mount from outside `$HOME` silently mounts EMPTY under colima.** colima's VM mounts
   only `$HOME` by default, so `docker run -v /private/tmp/…:/work` gives the container an existing
   but *empty* directory — no error, no warning. Every mount-based case then fails identically
