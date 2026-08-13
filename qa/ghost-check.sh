@@ -1,111 +1,190 @@
 #!/usr/bin/env bash
 # Ghost check for the Barnett Studios AI-SDLC component family.
 #
-# Two halves, both required, same reason as the Scriptorium original:
-#   1. AGREEMENT — is the published artifact the version `main` says it is?
-#   2. BOOT      — does a clean anonymous consumer actually get that artifact, and does it run?
+# The question is "is the published artifact the thing its version claims to be, and can an
+# outsider actually get it and run it?" — asked at every surface a consumer can reach.
 #
-# Half 1 alone is the wrong check for the defect class it exists for: every version can agree
-# while `docker pull ghcr.io/barnett-studios/<x>` (which resolves `latest`) hands the consumer a
-# months-old image. Agreement says nothing about what an outsider receives.
+# Note on the Scriptorium original this is adapted from: there, half 1 compares the deployed
+# SHA against `main`, because Scriptorium continuously deploys `main`. That anchor does NOT
+# port. This family ships *releases*, so `main` running ahead of the newest tag is the normal
+# state between releases, not a defect — gating on it would fire on all nine repos, every pass,
+# forever. The reference here is the **tag**, and the anchor is the image's recorded source
+# commit. Main-lag is reported as advisory context only.
 #
-# Runs anonymously on purpose — a token with read:packages would test a path no consumer walks.
-# Needs: curl, jq. Docker only for --boot.
+# Four halves, in increasing order of strength:
+#   1. PROVENANCE — the published image's org.opencontainers.image.revision is exactly the
+#      commit its own version tag points at, and that commit is on main. This is the real
+#      check: it verifies the artifact against *source*, not against another artifact's name.
+#   2. REACH      — `latest` resolves to the same digest as the newest semver tag, anonymously.
+#      A consumer runs `docker pull`, which resolves `latest`; if it lags they silently get old
+#      code while every version string still agrees.
+#   3. CRATE      — for crates.io members, the published max version equals the newest tag and
+#      nothing in the line is yanked.
+#   4. BOOT       — (with --boot) the image actually executes.
 #
+# Halves 2-4 are all "compare a published thing to another published thing" and can be green
+# together while the image was built from the wrong source. Only half 1 can see that.
+#
+# Runs anonymously on purpose: a token with read:packages walks a path no consumer walks, and
+# would go green against an image that had silently become private.
+#
+# Needs: curl, jq, gh. Docker only for --boot.
 # Usage: ./ghost-check.sh [--boot]
-#   --boot  additionally pull each `latest` and run its --help (slow, needs docker)
 
 set -uo pipefail
 
-COMPONENTS=(abproof attestr baseplate cascadr commitward cordon cxpak slicr)
-# corpus is a git-submodule data repo: no image, no crate. Its agreement check is tags-vs-VERSION.
-DATA_REPOS=(corpus)
+ORG=Barnett-Studios
+# component : is-on-crates.io
+IMAGES=(abproof attestr baseplate cascadr commitward cordon cxpak slicr)
+CRATES=(abproof attestr baseplate cascadr commitward cxpak)
+# corpus is a git-only eval set: no image, no crate. `cordon` and `corpus` on crates.io are
+# UNRELATED third-party crates (wgoodall01/cordon, DanCardin/corpus) — never version-compare
+# against them, it manufactures a mismatch out of nothing.
+VERSIONED_REPOS=(abproof attestr baseplate cascadr commitward cordon corpus cxpak slicr)
+
+ACCEPT='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
 
 BOOT=0
 [ "${1:-}" = "--boot" ] && BOOT=1
-
 fail=0
 note() { printf '%-11s %s\n' "$1" "$2"; }
 
 ghcr_token() {
-  curl -fsS "https://ghcr.io/token?scope=repository%3Abarnett-studios%2F$1%3Apull&service=ghcr.io" \
-    | jq -r '.token // empty'
+  curl -fsS "https://ghcr.io/token?scope=repository%3A$(echo "$ORG" | tr 'A-Z' 'a-z')%2F${1}%3Apull&service=ghcr.io" | jq -r '.token // empty'
 }
-
-# Resolve a tag to its manifest digest. Accept every manifest media type: asking for only one
-# makes the registry 404 an image published under the other, which reads as "missing" not "wrong".
-digest() {
-  curl -fsS -o /dev/null -D - -H "Authorization: Bearer $2" \
-    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-    "https://ghcr.io/v2/barnett-studios/$1/manifests/$3" \
+digest() { # repo token ref
+  curl -fsS -o /dev/null -D - -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" \
+    "https://ghcr.io/v2/barnett-studios/${1}/manifests/${3}" \
     | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}'
 }
+# The config blob carries org.opencontainers.image.* as Labels. The multi-arch index itself
+# carries no annotations, so descend to a real platform manifest first — and skip the
+# attestation manifests, whose platform is literally {os: unknown, architecture: unknown}.
+image_labels() { # repo token ref
+  local idx m mf cfg
+  idx=$(curl -fsS -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" "https://ghcr.io/v2/barnett-studios/${1}/manifests/${3}")
+  m=$(echo "$idx" | jq -r 'if .manifests then (.manifests[]|select(.platform.os!="unknown" and .platform.architecture!="unknown")|.digest) else empty end' | head -1)
+  if [ -n "$m" ]; then
+    mf=$(curl -fsS -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" "https://ghcr.io/v2/barnett-studios/${1}/manifests/${m}")
+  else mf="$idx"; fi
+  cfg=$(echo "$mf" | jq -r '.config.digest // empty')
+  [ -z "$cfg" ] && return 1
+  curl -fsSL -H "Authorization: Bearer $2" "https://ghcr.io/v2/barnett-studios/${1}/blobs/${cfg}" | jq -r '.config.Labels // {}'
+}
+newest_semver() { printf '%s\n' "$@" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1; }
 
-echo "== half 1+2: published artifact agreement and what an anonymous consumer receives"
-for c in "${COMPONENTS[@]}"; do
-  release=$(gh api "repos/Barnett-Studios/$c/releases/latest" --jq '.tag_name' 2>/dev/null | tr -d 'v')
+# macOS ships bash 3.2, which has no associative arrays. A temp file keyed by component is
+# the portable substitute; the supported platform is macOS, so `declare -A` is not available.
+VERMAP=$(mktemp)
+trap 'rm -f "$VERMAP"' EXIT
+vers() { awk -v k="$1" '$1==k{print $2; exit}' "$VERMAP"; }
+
+echo "== half 1: provenance — the image is built from the commit its version tag names"
+for c in "${IMAGES[@]}"; do
   tok=$(ghcr_token "$c")
-  if [ -z "$tok" ]; then note "$c" "FAIL no anonymous pull token — image is not public"; fail=1; continue; fi
-
-  tags=$(curl -fsS -H "Authorization: Bearer $tok" "https://ghcr.io/v2/barnett-studios/$c/tags/list")
-  newest=$(echo "$tags" | jq -r '[.tags[]|select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))]
-                                 | sort_by(split(".")|map(tonumber)) | last // empty')
-  if [ -z "$newest" ]; then note "$c" "FAIL no semver tag published"; fail=1; continue; fi
-
-  d_latest=$(digest "$c" "$tok" latest)
-  d_newest=$(digest "$c" "$tok" "$newest")
-  msg="release=${release:-none} newest=$newest"
-
-  if [ -z "$d_latest" ]; then
-    note "$c" "FAIL $msg — no :latest tag; README's docker pull gets nothing"; fail=1; continue
+  if [ -z "$tok" ]; then note "$c" "FAIL no anonymous pull token — the image is not public"; fail=1; continue; fi
+  labels=$(image_labels "$c" "$tok" latest) || { note "$c" "FAIL cannot read :latest config — no such tag?"; fail=1; continue; }
+  ver=$(echo "$labels" | jq -r '."org.opencontainers.image.version" // empty')
+  rev=$(echo "$labels" | jq -r '."org.opencontainers.image.revision" // empty')
+  if [ -z "$ver" ] || [ -z "$rev" ]; then
+    note "$c" "FAIL :latest carries no image.version/revision label — provenance unverifiable"; fail=1; continue
   fi
-  if [ "$d_latest" != "$d_newest" ]; then
-    note "$c" "FAIL $msg — :latest is STALE, consumers silently receive an older image"; fail=1; continue
+  echo "$c $ver" >> "$VERMAP"
+  # /tags returns commit.sha already peeled through annotated tags.
+  tagsha=$(gh api "repos/$ORG/$c/tags" --paginate --jq ".[]|select(.name==\"v${ver}\")|.commit.sha" 2>/dev/null | head -1)
+  if [ -z "$tagsha" ]; then
+    note "$c" "FAIL :latest claims $ver but no tag v$ver exists — an image nobody can trace to source"; fail=1; continue
   fi
-  if [ -n "$release" ] && [ "$release" != "$newest" ]; then
-    note "$c" "FAIL $msg — GitHub release and published image disagree"; fail=1; continue
+  if [ "$rev" != "$tagsha" ]; then
+    note "$c" "FAIL :latest($ver) built from ${rev:0:12} but v$ver is ${tagsha:0:12} — image and tag disagree"; fail=1; continue
   fi
+  onmain=$(gh api "repos/$ORG/$c/compare/main...${rev}" --jq '.status' 2>/dev/null)
+  case "$onmain" in
+    identical|behind) ;;
+    *) note "$c" "FAIL the published commit ${rev:0:12} is not an ancestor of main (status=$onmain)"; fail=1; continue ;;
+  esac
+  lag=$(gh api "repos/$ORG/$c/compare/v${ver}...main" --jq '.ahead_by' 2>/dev/null)
+  note "$c" "ok   v$ver @ ${rev:0:12} on main · main is +${lag:-?} commits (advisory)"
+done
 
-  if [ "$BOOT" = 1 ]; then
-    # ${c} braces are load-bearing: in zsh "$c:latest" applies the :l (lowercase) history
-    # modifier and silently yields e.g. `abproofatest:latest`, which the registry rejects as
-    # `denied` — indistinguishable from a genuinely private image. Cost this check an hour.
+echo "== half 2: reach — what an anonymous \`docker pull\` actually resolves"
+for c in "${IMAGES[@]}"; do
+  tok=$(ghcr_token "$c"); [ -z "$tok" ] && continue
+  tags=$(curl -fsS -H "Authorization: Bearer $tok" "https://ghcr.io/v2/barnett-studios/${c}/tags/list" | jq -r '.tags[]?')
+  newest=$(newest_semver $tags)
+  [ -z "$newest" ] && { note "$c" "FAIL no semver tag published"; fail=1; continue; }
+  dl=$(digest "$c" "$tok" latest); dn=$(digest "$c" "$tok" "$newest")
+  if [ -z "$dl" ]; then note "$c" "FAIL no :latest — the README's docker pull gets nothing"; fail=1
+  elif [ "$dl" != "$dn" ]; then note "$c" "FAIL :latest is STALE vs $newest — consumers silently receive an older image"; fail=1
+  elif [ -n "$(vers "$c")" ] && [ "$newest" != "$(vers "$c")" ]; then
+    note "$c" "FAIL :latest labels itself $(vers "$c") but $newest is published — latest is not the newest"; fail=1
+  else note "$c" "ok   :latest == :$newest (${dl:0:19})"; fi
+done
+
+echo "== half 3: crates.io — the published crate matches the tag and is not yanked"
+for c in "${CRATES[@]}"; do
+  j=$(curl -fsS "https://crates.io/api/v1/crates/$c" -H 'User-Agent: barnett-studios-qa')
+  repo=$(echo "$j" | jq -r '.crate.repository // ""')
+  # Guard against name collisions with unrelated crates before believing any version.
+  case "$repo" in
+    *"github.com/$ORG/$c"*) ;;
+    *) note "$c" "FAIL crates.io/$c points at '$repo' — not this org's crate"; fail=1; continue ;;
+  esac
+  max=$(echo "$j" | jq -r '.crate.max_version')
+  yanked=$(echo "$j" | jq -r '[.versions[]|select(.yanked)|.num]|join(",")')
+  want=$(vers "$c")
+  if [ -n "$want" ] && [ "$max" != "$want" ]; then
+    note "$c" "FAIL crates.io has $max but the published image is $want — the two consumer paths disagree"; fail=1
+  elif [ -n "$yanked" ]; then note "$c" "ok   $max (yanked in line: $yanked)"
+  else note "$c" "ok   $max"; fi
+done
+
+echo "== half 4: the tag's own content agrees with the tag's name"
+# corpus#30's defect class, generalised: a tag named v0.2.0 whose tree declares 0.4.0. Reported
+# as WARN, not FAIL — a red ghost check means "your findings this pass are untrustworthy, stop",
+# and corpus tag drift does not make a finding about cascadr wrong. Gating every future pass on
+# an already-filed product defect trains the loop to ignore its own red.
+for c in "${VERSIONED_REPOS[@]}"; do
+  tag=$(gh api "repos/$ORG/$c/tags" --jq '.[0].name' 2>/dev/null)
+  [ -z "$tag" ] && { note "$c" "WARN no tags at all"; continue; }
+  sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null | head -1)
+  v=$(gh api "repos/$ORG/$c/contents/VERSION?ref=$sha" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n ')
+  [ -z "$v" ] && v=$(gh api "repos/$ORG/$c/contents/Cargo.toml?ref=$sha" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | awk -F'"' '/^version/{print $2; exit}')
+  if [ -z "$v" ]; then note "$c" "ok   $tag (no VERSION/Cargo.toml at that ref — nothing to contradict)"
+  elif [ "$tag" != "v$v" ]; then note "$c" "WARN $tag names a tree that declares $v — a version pin misdescribes what it pins"
+  else note "$c" "ok   $tag == v$v"; fi
+done
+
+if [ "$BOOT" = 1 ]; then
+  echo "== boot: the image executes"
+  for c in "${IMAGES[@]}"; do
+    # ${c} braces are load-bearing under zsh, where "$c:latest" applies the :l (lowercase)
+    # modifier and silently yields `abproofatest:latest`. The registry answers `denied`, which
+    # is indistinguishable from a private image. Cost this check an hour and a whole false
+    # theory about stale docker credentials.
     img="ghcr.io/barnett-studios/${c}:latest"
-    if ! docker pull "$img" >/dev/null 2>&1; then
-      note "$c" "FAIL $msg — anonymous docker pull rejected"; fail=1; continue
-    fi
-    # cordon's image is deliberately NOT a CLI: it is the swappable <runtime> argument to
-    # cordon-run.sh, documented as `git + python3 + build-essential` with no entrypoint.
-    # Probing it with --help asserts a promise the README explicitly disclaims.
+    docker pull "$img" >/dev/null 2>&1 || { note "$c" "FAIL anonymous docker pull rejected"; fail=1; continue; }
     if [ "$c" = cordon ]; then
+      # cordon's image is deliberately NOT a CLI: it is the swappable <runtime> argument to
+      # cordon-run.sh, documented as `git + python3 + build-essential` with no entrypoint.
+      # Probing it with --help asserts a promise its README explicitly disclaims.
       docker run --rm "$img" python3 -c 'print(1)' >/dev/null 2>&1 \
-        || { note "$c" "FAIL $msg — runtime image lacks the documented python3"; fail=1; continue; }
+        && note "$c" "ok   runtime image has the documented python3" \
+        || { note "$c" "FAIL runtime image lacks the documented python3"; fail=1; }
     else
-      # "Does it boot", not "does --help exit 0". A usage message on rc=2 is a booted binary
-      # making a style choice; 125/126/127 are docker/exec failures and mean nothing ran.
       out=$(timeout 90 docker run --rm "$img" --help 2>&1); rc=$?
+      # "Does it boot", not "does --help exit 0": a usage message on rc=2 is a booted binary
+      # making a style choice (slicr does exactly this). 125/126/127 mean nothing ran.
       case "$rc" in
-        125|126|127) note "$c" "FAIL $msg — image does not execute (rc=$rc): $(echo "$out"|head -1)"; fail=1; continue ;;
+        125|126|127) note "$c" "FAIL does not execute (rc=$rc): $(echo "$out"|head -1)"; fail=1 ;;
+        *) if [ -z "$out" ]; then note "$c" "FAIL ran but produced no output"; fail=1
+           else note "$c" "ok   executes (rc=$rc)"; fi ;;
       esac
-      [ -z "$out" ] && { note "$c" "FAIL $msg — ran but produced no output at all"; fail=1; continue; }
     fi
-    msg="$msg boot=ok"
-  fi
-  note "$c" "ok   $msg"
-done
+  done
+fi
 
-# WARN, not FAIL, and the distinction is the point: a RED ghost check means "your findings this
-# pass are untrustworthy, stop". Corpus tag drift does not make a finding about cascadr wrong, so
-# gating every future pass on it would train the loop to ignore its own red. It is a filed product
-# defect (corpus#30), not a broken substrate.
-echo "== data repos (advisory): VERSION and the newest release tag agree"
-for c in "${DATA_REPOS[@]}"; do
-  v=$(gh api "repos/Barnett-Studios/$c/contents/VERSION" --jq '.content' 2>/dev/null | base64 -d | tr -d '\n ')
-  t=$(gh api "repos/Barnett-Studios/$c/releases/latest" --jq '.tag_name' 2>/dev/null | tr -d 'v')
-  if [ -z "$v" ]; then note "$c" "WARN no VERSION file"
-  elif [ "$v" != "$t" ]; then note "$c" "WARN VERSION=$v but newest release=v$t — a version pin cannot reach $v (corpus#30)"
-  else note "$c" "ok   VERSION=$v release=v$t"; fi
-done
-
-[ "$fail" = 0 ] && echo "GHOST CHECK GREEN" || echo "GHOST CHECK RED — stop and report; do not file product findings against this state"
+echo
+[ "$fail" = 0 ] && echo "GHOST CHECK GREEN" \
+  || echo "GHOST CHECK RED — stop and report; do not file product findings against this state"
 exit "$fail"
