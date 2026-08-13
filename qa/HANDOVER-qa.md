@@ -101,10 +101,12 @@ gating every pass on it would train the loop to ignore its own red.
 4. **Drive the documented path, as an outsider, from a scratch directory.** Not a clone with the
    repo's own fixtures — the README's install instructions, run verbatim, in a fresh dir. If the
    README says `curl` the release asset and verify the checksum, do exactly that.
-5. **Then check the promise, not just the smoke.** Every repo has a `CONTRACT.md`. It states
+5. **Then check the promise, not just the smoke.** Eight of the nine ship a `CONTRACT.md` stating
    guarantees in testable language (`exit 0 ⇔ solved`, `--network none`, `absent ⇒ SKIPPED, never
-   failed`). Drive those directly. A component that boots and violates its contract is the
-   higher-value finding.
+   failed`). Drive those directly — a component that boots and violates its contract is the
+   higher-value finding. **`cxpak` is the exception and has none** (cxpak#59), so its only
+   specification is the README; treat the README's commands as the contract there, and say so when
+   filing, because "the README says X" is a weaker claim than "CONTRACT.md guarantees X".
 6. **File what you find.** Below.
 7. **Log the pass.** Below — whether or not you found anything, especially if you did not.
 
