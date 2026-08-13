@@ -219,6 +219,13 @@ contradicted it. They are here because each cost real time on the first pass (20
   manufactures a mismatch out of nothing. Check `.crate.repository` before believing a version.
 - **`gh <cmd> --json` returns empty here** under the rtk hook. Verify through `gh api`. An empty
   result read as "no labels exist" is a silent false negative.
+- **A bind mount from outside `$HOME` silently mounts EMPTY under colima.** colima's VM mounts
+  only `$HOME` by default, so `docker run -v /private/tmp/…:/work` gives the container an existing
+  but *empty* directory — no error, no warning. Every mount-based case then fails identically
+  ("plan.md not found"), which reads exactly like a broken tool. **Run all mount-based tests from a
+  directory under `$HOME`** (e.g. `~/qa-scratch`), and prove the mount before trusting the result:
+  `docker run --rm -v "$PWD":/work --entrypoint="" <img> sh -c 'ls -a /work'`. A uniform failure
+  across every case is a harness bug until proven otherwise.
 - **macOS ships bash 3.2.** No associative arrays — `declare -A` fails with `invalid option`,
   and under `set -u` the next line dies with `unbound variable`. The supported platform is macOS,
   so anything in `qa/` has to run on 3.2.
