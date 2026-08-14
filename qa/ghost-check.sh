@@ -155,6 +155,42 @@ for c in "${VERSIONED_REPOS[@]}"; do
   else note "$c" "ok   $tag == v$v"; fi
 done
 
+echo "== half 5: currency — merged fixes the release does not contain (advisory, a FLOOR)"
+# The other four halves all test **agreement**: tag↔commit, latest↔digest, crates.io↔tag,
+# content↔name. None tests **currency** — whether the version consumers actually install still
+# contains defects this org has already fixed. Those are different questions, and the 2026-08-14T02:08Z
+# pass proved it: all four halves green while the published baseplate and cascadr carried three
+# known defects, two of them fixed and merged (cascadr#9, baseplate#5). `main is +N commits` in
+# half 1 is the only existing hint and it is the wrong resolution — `+13 commits` reads identically
+# whether those are typo fixes or the cache-integrity guard (.github#6).
+#
+# Advisory, never a FAIL, and nothing below sets `fail`. Shipping cadence is the maintainer's call,
+# and a red ghost check means "your findings this pass are untrustworthy, stop" — release debt does
+# not make that true.
+#
+# **The count is a floor, not a total**, and the header says so because a bounded number printed
+# bare reads as a complete one. Only merged PRs whose title carries a conventional-commit `fix`
+# scope are counted; `docs`/`test`/`feat`/`refactor` are excluded so a docs-heavy week does not cry
+# wolf. A fix shipped under `feat(` or an unconventional title is therefore missed — under-reporting
+# is the safer direction for an advisory line, but it is under-reporting.
+for c in "${VERSIONED_REPOS[@]}"; do
+  tag=$(gh api "repos/$ORG/$c/tags" --jq '.[0].name' 2>/dev/null)
+  [ -z "$tag" ] && { note "$c" "ok   no tags — nothing to be behind"; continue; }
+  sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null | head -1)
+  # The release PR merges within a second of the tag commit, so the boundary is fuzzy by about
+  # that much. It only ever admits the release commit itself, which is not a `fix(`.
+  tagdate=$(gh api "repos/$ORG/$c/commits/$sha" --jq '.commit.committer.date' 2>/dev/null)
+  [ -z "$tagdate" ] && { note "$c" "WARN cannot date $tag — currency unknown"; continue; }
+  # TSV out of jq, comparison in awk: ISO-8601 compares correctly as a string, and this keeps the
+  # jq filter single-quoted instead of nesting shell quotes inside a jq regex.
+  debt=$(gh api "repos/$ORG/$c/pulls?state=closed&per_page=100" --paginate \
+           --jq '.[]|select(.merged_at!=null)|"\(.merged_at)\t\(.number)\t\(.title)"' 2>/dev/null \
+         | awk -F'\t' -v d="$tagdate" '$1>d && $3 ~ /^fix[(:]/ {printf "#%s ", $2}')
+  n=$(printf '%s' "$debt" | tr ' ' '\n' | grep -c '^#')
+  if [ "$n" = 0 ]; then note "$c" "ok   $tag carries every merged fix"
+  else note "$c" "DEBT $n unreleased fix(es) since $tag: ${debt% }"; fi
+done
+
 if [ "$BOOT" = 1 ]; then
   echo "== boot: the image executes"
   for c in "${IMAGES[@]}"; do
