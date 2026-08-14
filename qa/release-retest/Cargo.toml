@@ -1,0 +1,12 @@
+[package]
+name = "release-retest"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Version REQUIREMENTS, not pins, and Cargo.lock is deliberately not committed: the point of
+# this harness is that a new release changes what resolves here. Pinning would silence the
+# very signal it exists to raise. Bump a requirement when a component crosses a minor.
+[dependencies]
+baseplate = "0.2"
+cascadr = "0.2"

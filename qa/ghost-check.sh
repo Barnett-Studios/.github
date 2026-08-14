@@ -11,7 +11,9 @@
 # forever. The reference here is the **tag**, and the anchor is the image's recorded source
 # commit. Main-lag is reported as advisory context only.
 #
-# Four halves, in increasing order of strength:
+# Five halves. The first four ask "is the artifact what it claims to be"; the fifth asks the
+# separate question "is what it claims to be still current", which no amount of agreement can
+# answer:
 #   1. PROVENANCE — the published image's org.opencontainers.image.revision is exactly the
 #      commit its own version tag points at, and that commit is on main. This is the real
 #      check: it verifies the artifact against *source*, not against another artifact's name.
@@ -20,10 +22,15 @@
 #      code while every version string still agrees.
 #   3. CRATE      — for crates.io members, the published max version equals the newest tag and
 #      nothing in the line is yanked.
-#   4. BOOT       — (with --boot) the image actually executes.
+#   4. CONTENT    — the tag's tree declares the version the tag names.
+#   5. CURRENCY   — merged `fix(` PRs that are on main but not in the release. ADVISORY.
+#   BOOT          — (with --boot) the image actually executes.
 #
 # Halves 2-4 are all "compare a published thing to another published thing" and can be green
 # together while the image was built from the wrong source. Only half 1 can see that.
+#
+# And all of 1-4 can be green while the release is materially behind: they verify identity,
+# never currency. Half 5 exists because that combination was observed, not imagined.
 #
 # Runs anonymously on purpose: a token with read:packages walks a path no consumer walks, and
 # would go green against an image that had silently become private.
@@ -153,6 +160,43 @@ for c in "${VERSIONED_REPOS[@]}"; do
   if [ -z "$v" ]; then note "$c" "ok   $tag (no VERSION/Cargo.toml at that ref — nothing to contradict)"
   elif [ "$tag" != "v$v" ]; then note "$c" "WARN $tag names a tree that declares $v — a version pin misdescribes what it pins"
   else note "$c" "ok   $tag == v$v"; fi
+done
+
+echo "== half 5: currency — merged fixes the release does not contain (advisory)"
+# The four halves above all test AGREEMENT: tag↔commit, latest↔digest, crates.io↔tag,
+# content↔name. Every one of them can be green while the version consumers install still
+# contains defects the repo has already closed. That is not hypothetical: the pass logged at
+# 2026-08-14T02:08Z measured cascadr#9 (the cache-integrity guard) and baseplate#5 (the
+# java_test false positives) live in the published artifacts with all four halves green.
+#
+# `main is +N commits (advisory)` in half 1 is the only existing hint, and it is the wrong
+# resolution — +13 commits reads identically whether they are typo fixes or a security guard.
+#
+# ADVISORY, never a FAIL: nothing here touches `fail`. Shipping cadence is the maintainer's
+# call, and a red ghost check means "your findings this pass are untrustworthy, stop" — which
+# release debt does not make true.
+#
+# Deliberately narrow. Only merged PRs whose title carries a conventional-commit `fix` scope
+# (`fix(...)` or `fix:`); docs/test/feat/refactor are excluded so a docs-heavy week does not
+# cry wolf. This UNDER-reports on purpose — a fix that shipped under `feat(` or an
+# unconventional title is missed. For an advisory line, silence on a real fix is a smaller
+# harm than noise on a docs commit, and the count is a floor, not a total.
+for c in "${VERSIONED_REPOS[@]}"; do
+  tag=$(gh api "repos/$ORG/$c/tags" --jq '.[0].name' 2>/dev/null)
+  [ -z "$tag" ] && { note "$c" "ok   no tags — nothing to be behind"; continue; }
+  sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null | head -1)
+  # The release PR itself merges within a second of the tag commit, so the boundary is fuzzy
+  # by about that much. It only ever admits the release commit, which is not a `fix(`.
+  tagdate=$(gh api "repos/$ORG/$c/commits/$sha" --jq '.commit.committer.date' 2>/dev/null)
+  [ -z "$tagdate" ] && { note "$c" "WARN cannot date $tag — currency unknown"; continue; }
+  # TSV out of jq, comparison in awk: ISO-8601 compares correctly as a string, and this keeps
+  # the jq filter single-quoted instead of nesting shell quotes inside a jq regex.
+  debt=$(gh api "repos/$ORG/$c/pulls?state=closed&per_page=100" --paginate \
+           --jq '.[]|select(.merged_at!=null)|"\(.merged_at)\t\(.number)\t\(.title)"' 2>/dev/null \
+         | awk -F'\t' -v d="$tagdate" '$1>d && $3 ~ /^fix[(:]/ {printf "#%s ", $2}')
+  n=$(printf '%s' "$debt" | tr ' ' '\n' | grep -c '^#')
+  if [ "$n" = 0 ]; then note "$c" "ok   $tag carries every merged fix"
+  else note "$c" "DEBT $n unreleased fix(es) since $tag: ${debt% }"; fi
 done
 
 if [ "$BOOT" = 1 ]; then
