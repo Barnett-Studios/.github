@@ -303,6 +303,11 @@ never driven: attestr verify · cascadr routing · cxpak context · baseplate op
               commitward gate · abproof run · slicr plan · corpus loader · assembly
 ```
 
+- **Stamp the entry from `date -u +"%Y-%m-%dT%H:%MZ"`, never from local time.** The `Z` is a claim,
+  and this loop compares pass times against image push and release times to decide whether a
+  release landed before or after a pass — a silent offset is enough to invert that. Every entry
+  logged before `2026-08-14T01:26Z` is 3h fast: local EEST wearing a `Z`. Left uncorrected in place
+  so the log stays append-only; a comment's GitHub `created_at` is the authority for an old entry.
 - **Record passes, not just failures.** A green result is the boundary that dates the next
   regression. A log of only failures cannot bound anything.
 - **Always record the ghost-check verdict**, so a future reader can tell a product regression from
