@@ -162,7 +162,7 @@ for c in "${VERSIONED_REPOS[@]}"; do
   else note "$c" "ok   $tag == v$v"; fi
 done
 
-echo "== half 5: currency — merged fixes the release does not contain (advisory)"
+echo "== half 5: currency — merged fixes the release does not contain (advisory, a FLOOR)"
 # The four halves above all test AGREEMENT: tag↔commit, latest↔digest, crates.io↔tag,
 # content↔name. Every one of them can be green while the version consumers install still
 # contains defects the repo has already closed. That is not hypothetical: the pass logged at
