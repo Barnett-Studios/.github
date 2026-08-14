@@ -157,7 +157,23 @@ for c in "${VERSIONED_REPOS[@]}"; do
   sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null | head -1)
   v=$(gh api "repos/$ORG/$c/contents/VERSION?ref=$sha" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n ')
   [ -z "$v" ] && v=$(gh api "repos/$ORG/$c/contents/Cargo.toml?ref=$sha" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | awk -F'"' '/^version/{print $2; exit}')
-  if [ -z "$v" ]; then note "$c" "ok   $tag (no VERSION/Cargo.toml at that ref — nothing to contradict)"
+  # "Nothing to contradict" was reported as `ok`, and it is not one. The file this half
+  # compares against is simply absent at that ref, so the comparison did not happen — a check
+  # that could not run is UNKNOWN, not a pass. It fired on two of the nine: cordon and slicr
+  # carry no VERSION or Cargo.toml at their latest tag, and both their CONTRACTs assert
+  # "`VERSION` holds this component's version and every release carries a matching
+  # `v<version>` tag" — the exact claim this half exists to verify, waved through on the
+  # strength of the file being missing. A future tag cut without VERSION in the tree would be
+  # waved through the same way.
+  #
+  # Still not a FAIL, for half 4's stated reason: a red ghost check means "stop, your findings
+  # are untrustworthy", and an unverifiable version claim about one component does not make a
+  # finding about another wrong. `main`'s value is printed as context, not compared — this
+  # half is about the TAG's tree, and a tag whose tree lacks the file cannot be fixed by
+  # reading a different ref.
+  if [ -z "$v" ]; then
+    mv=$(gh api "repos/$ORG/$c/contents/VERSION?ref=main" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n ')
+    note "$c" "WARN $tag declares no version — no VERSION/Cargo.toml at that ref, so the tag-vs-tree claim is UNVERIFIABLE${mv:+ (main says $mv)}"
   elif [ "$tag" != "v$v" ]; then note "$c" "WARN $tag names a tree that declares $v — a version pin misdescribes what it pins"
   else note "$c" "ok   $tag == v$v"; fi
 done
