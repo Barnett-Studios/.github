@@ -175,7 +175,15 @@ if [ "$BOOT" = 1 ]; then
       out=$(timeout 90 docker run --rm "$img" --help 2>&1); rc=$?
       # "Does it boot", not "does --help exit 0": a usage message on rc=2 is a booted binary
       # making a style choice (slicr does exactly this). 125/126/127 mean nothing ran.
+      #
+      # 124 is `timeout` killing it, and it must FAIL rather than read as "executes". This
+      # check reported `baseplate ok executes (rc=124)` on 2026-08-14 — i.e. it called a
+      # 90-second hang a passing boot. A hang is the failure mode this family exists to bound
+      # (see cordon's README: "the failure you actually get is a hang, not an escape"), so it
+      # is the last thing the boot probe should wave through. That instance did not reproduce
+      # in four subsequent runs and was not filed; the misclassification is the real defect.
       case "$rc" in
+        124) note "$c" "FAIL HUNG — killed at the 90s deadline; re-run, and file it if it recurs"; fail=1 ;;
         125|126|127) note "$c" "FAIL does not execute (rc=$rc): $(echo "$out"|head -1)"; fail=1 ;;
         *) if [ -z "$out" ]; then note "$c" "FAIL ran but produced no output"; fail=1
            else note "$c" "ok   executes (rc=$rc)"; fi ;;
