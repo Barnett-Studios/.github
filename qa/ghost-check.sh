@@ -197,9 +197,30 @@ echo "== half 5: currency — merged fixes the release does not contain (advisor
 # cry wolf. This UNDER-reports on purpose — a fix that shipped under `feat(` or an
 # unconventional title is missed. For an advisory line, silence on a real fix is a smaller
 # harm than noise on a docs commit, and the count is a floor, not a total.
+#
+# A FAILED QUERY IS NOT A CLEAN RESULT — the same rule half 4 states three blocks up, "a
+# check that could not run is UNKNOWN, not a pass", applied to the two lookups here that
+# could print `ok` without an answer. `2>/dev/null` discards the diagnostic and `$( )`
+# discards the status, so an empty result reads the same whether the query said "none" or
+# never answered. Driven, with only the named query failing and everything else real:
+#
+#   pulls query fails   ->  all 9 printed `ok <tag> carries every merged fix`, and the run
+#                           still ended GHOST CHECK GREEN — 33 unreleased fixes erased
+#   tags query fails    ->  all 9 printed `ok no tags — nothing to be behind`, while half 4
+#                           printed `WARN no tags at all` for the very same failure
+#
+# The second one is why both are fixed and not just the reported one: `[ -z "$tag" ]` looks
+# like a guard, and it is — it just resolves the wrong way. This matters more than a usual
+# flake because the rotation reads a FALLING debt count as "a release shipped"; a transient
+# failure produces exactly that signal, so the instrument can announce a release that did not
+# happen (.github#11).
 for c in "${VERSIONED_REPOS[@]}"; do
-  tag=$(gh api "repos/$ORG/$c/tags" --jq '.[0].name' 2>/dev/null)
+  if ! tag=$(gh api "repos/$ORG/$c/tags" --jq '.[0].name' 2>/dev/null); then
+    note "$c" "WARN cannot list tags — currency unknown"; continue
+  fi
   [ -z "$tag" ] && { note "$c" "ok   no tags — nothing to be behind"; continue; }
+  # Not guarded, deliberately: every path out of this one lands on the `tagdate` WARN below,
+  # so it cannot produce a clean line. The defect is `ok` from a query that did not run.
   sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null | head -1)
   # The release PR itself merges within a second of the tag commit, so the boundary is fuzzy
   # by about that much. It only ever admits the release commit, which is not a `fix(`.
@@ -207,8 +228,13 @@ for c in "${VERSIONED_REPOS[@]}"; do
   [ -z "$tagdate" ] && { note "$c" "WARN cannot date $tag — currency unknown"; continue; }
   # TSV out of jq, comparison in awk: ISO-8601 compares correctly as a string, and this keeps
   # the jq filter single-quoted instead of nesting shell quotes inside a jq regex.
-  debt=$(gh api "repos/$ORG/$c/pulls?state=closed&per_page=100" --paginate \
-           --jq '.[]|select(.merged_at!=null)|"\(.merged_at)\t\(.number)\t\(.title)"' 2>/dev/null \
+  # Two steps, so the query's status is consulted before its emptiness is interpreted. As one
+  # pipeline the assignment took awk's status and the failure vanished.
+  if ! merged=$(gh api "repos/$ORG/$c/pulls?state=closed&per_page=100" --paginate \
+                  --jq '.[]|select(.merged_at!=null)|"\(.merged_at)\t\(.number)\t\(.title)"' 2>/dev/null); then
+    note "$c" "WARN cannot list merged PRs — currency unknown"; continue
+  fi
+  debt=$(printf '%s\n' "$merged" \
          | awk -F'\t' -v d="$tagdate" '$1>d && $3 ~ /^fix[(:]/ {printf "#%s ", $2}')
   n=$(printf '%s' "$debt" | tr ' ' '\n' | grep -c '^#')
   if [ "$n" = 0 ]; then note "$c" "ok   $tag carries every merged fix"
