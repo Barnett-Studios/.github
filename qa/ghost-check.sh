@@ -219,12 +219,31 @@ for c in "${VERSIONED_REPOS[@]}"; do
     note "$c" "WARN cannot list tags — currency unknown"; continue
   fi
   [ -z "$tag" ] && { note "$c" "ok   no tags — nothing to be behind"; continue; }
-  # Not guarded, deliberately: every path out of this one lands on the `tagdate` WARN below,
-  # so it cannot produce a clean line. The defect is `ok` from a query that did not run.
-  sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null | head -1)
+  # Guarded too, and my reason for exempting it was wrong in a way worth recording: I argued
+  # that a failure here lands on the `tagdate` WARN below, so it could not print a clean
+  # line. It can. `gh` writes the API ERROR BODY TO STDOUT — `{"message":"No commit found
+  # for SHA: ",…}` — so `tagdate` is that JSON blob, `[ -z ]` is false, the WARN is skipped,
+  # and the blob becomes awk's `d`. `{` sorts above every digit, so `$1 > d` is false for
+  # every merged PR, `n=0`, and all nine components print `ok <tag> carries every merged
+  # fix` — 33 unreleased fixes erased by a query that failed.
+  #
+  # Which is the same defect one layer along: emptiness is not a failure signal, because a
+  # failed `gh` leaves a JSON object on stdout. Only the STATUS says whether it ran, and
+  # `if ! x=$(…)` reads it and never looks at stdout at all.
+  #
+  # The pipe is separate from the status read on purpose: `x=$(gh … | head -1)` takes
+  # `head`'s status, which is 0 whatever `gh` did — the same trap as the `| awk` below.
+  if ! sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null); then
+    note "$c" "WARN cannot resolve $tag to a commit — currency unknown"; continue
+  fi
+  sha="$(printf '%s\n' "$sha" | head -1)"
+  [ -z "$sha" ] && { note "$c" "WARN $tag resolves to no commit — currency unknown"; continue; }
   # The release PR itself merges within a second of the tag commit, so the boundary is fuzzy
   # by about that much. It only ever admits the release commit, which is not a `fix(`.
-  tagdate=$(gh api "repos/$ORG/$c/commits/$sha" --jq '.commit.committer.date' 2>/dev/null)
+  if ! tagdate=$(gh api "repos/$ORG/$c/commits/$sha" --jq '.commit.committer.date' 2>/dev/null); then
+    note "$c" "WARN cannot date $tag — currency unknown"; continue
+  fi
+  # Status AND emptiness: a call that succeeds but yields nothing is also not a date.
   [ -z "$tagdate" ] && { note "$c" "WARN cannot date $tag — currency unknown"; continue; }
   # TSV out of jq, comparison in awk: ISO-8601 compares correctly as a string, and this keeps
   # the jq filter single-quoted instead of nesting shell quotes inside a jq regex.
