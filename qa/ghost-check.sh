@@ -181,12 +181,14 @@ version_declarations() { # repo sha
         # cannot contribute a version.
         # Section-scoped: a `version = "1"` under [dependencies.foo] is a pin, not a
         # declaration, and it sits at the start of its own line just like the real one.
-        printf '%s' "$body" | awk -v c="$c" '
+        # No temp file: a predictable path in a world-writable directory, which this estate
+        # argued against in baseplate#25 and which docs/standards/tooling-traps.md and
+        # dotclaude#159 both rule out. Command substitution does the same job with no file.
+        v=$(printf '%s' "$body" | awk -v c="$c" '
           /^\[/{sec=$0}
           sec ~ /^\[(package|project)\]/ && /^name *= *"/{gsub(/^name *= *"|".*$/,""); if ($0==c) named=1}
           sec ~ /^\[(package|project)\]/ && /^version *= *"/{if (!seen) {gsub(/^version *= *"|".*$/,""); ver=$0; seen=1}}
-          END{if (named && seen) print ver}' > /tmp/.gc_v$$ 2>/dev/null
-        v=$(cat /tmp/.gc_v$$ 2>/dev/null); rm -f /tmp/.gc_v$$ ;;
+          END{if (named && seen) print ver}' 2>/dev/null) ;;
       package.json|plugin.json)
         v=$(printf '%s' "$body" | jq -r --arg c "$c" 'select(.name==$c)|.version // empty' 2>/dev/null) ;;
       marketplace.json)
@@ -212,7 +214,17 @@ for c in "${VERSIONED_REPOS[@]}"; do
   tag=$(gh api "repos/$ORG/$c/tags" --jq '.[0].name' 2>/dev/null)
   [ -z "$tag" ] && { note "$c" "WARN no tags at all"; continue; }
   sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null | head -1)
-  decls=$(version_declarations "$c" "$sha") || decls=""
+  # `|| decls=""` mapped a FAILED tree listing onto the identical state as "the tree was read
+  # and declares nothing", and the message below then asserted a fact about a tree that was
+  # never listed. That is the rule half 5 states, broken by the enumeration half 4 now depends
+  # on: a query that failed is not an empty result. The cost is not a false green — it is a
+  # WARN with the wrong cause, which is how a transient 502 gets filed as a product defect
+  # (.github#15, where a transient 500 accused attestr of unpublished provenance).
+  if ! decls=$(version_declarations "$c" "$sha"); then
+    note "$c" "WARN cannot list $tag's tree — half 4 is UNKNOWN for $c this pass (the API call \
+failed; this says nothing about what the tree declares)"
+    continue
+  fi
   # "Nothing to contradict" was reported as `ok`, and it is not one. The file this half
   # compares against is simply absent at that ref, so the comparison did not happen — a check
   # that could not run is UNKNOWN, not a pass. It fired on two of the nine: cordon and slicr
