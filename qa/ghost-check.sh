@@ -146,6 +146,65 @@ for c in "${CRATES[@]}"; do
   else note "$c" "ok   $max"; fi
 done
 
+# Every place the tag's tree declares THIS component's OWN version, as `path=version` lines.
+#
+# Half 4 used to read one file — VERSION, else Cargo.toml — and stop at the first hit, so a tree
+# that declares its version in four places was compared in one. cxpak v3.1.4 declared 3.1.3 in
+# three of its four and half 4 printed `ok` on every pass since the tag (.github#13). The stale
+# one was `ensure-cxpak`'s REQUIRED_VERSION, compared with exact equality, so the shipped plugin
+# rejected the binary the shipped release produced.
+#
+# Self-identifying by construction, which is what keeps this quiet on the other eight: a manifest
+# counts only when it NAMES this component. A vendored crate's Cargo.toml says
+# `name = "tree-sitter-scss"`, a seed fixture says `name = "test"`, a dependency pin names
+# something else — none of them can enter the set, so no denylist is needed and none can rot. The
+# census on .github#13 measured 26 benign version-like hits in cxpak's tree and 6 in corpus's;
+# this rule admits none of them.
+#
+# Returns non-zero if the tree could not be listed. A query that failed is not an empty result —
+# the rule half 5 states, applied to the enumeration half 4 now depends on.
+version_declarations() { # repo sha
+  local c="$1" sha="$2" paths path body v
+  paths=$(gh api "repos/$ORG/$c/git/trees/${sha}?recursive=1" --jq '.tree[]|select(.type=="blob")|.path' 2>/dev/null) || return 1
+  [ -z "$paths" ] && return 1
+  while IFS= read -r path; do
+    case "$(basename "$path")" in
+      VERSION|Cargo.toml|package.json|pyproject.toml|plugin.json|marketplace.json) ;;
+      *) case "$(basename "$path")" in *"$c"*) ;; *) continue ;; esac ;;
+    esac
+    body=$(gh api "repos/$ORG/$c/contents/${path}?ref=${sha}" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null) || continue
+    v=""
+    case "$(basename "$path")" in
+      VERSION) v=$(printf '%s' "$body" | tr -d '\n ') ;;
+      Cargo.toml|pyproject.toml)
+        # Only when the manifest names THIS component, so vendored and fixture manifests
+        # cannot contribute a version.
+        # Section-scoped: a `version = "1"` under [dependencies.foo] is a pin, not a
+        # declaration, and it sits at the start of its own line just like the real one.
+        # No temp file: a predictable path in a world-writable directory, which this estate
+        # argued against in baseplate#25 and which docs/standards/tooling-traps.md and
+        # dotclaude#159 both rule out. Command substitution does the same job with no file.
+        v=$(printf '%s' "$body" | awk -v c="$c" '
+          /^\[/{sec=$0}
+          sec ~ /^\[(package|project)\]/ && /^name *= *"/{gsub(/^name *= *"|".*$/,""); if ($0==c) named=1}
+          sec ~ /^\[(package|project)\]/ && /^version *= *"/{if (!seen) {gsub(/^version *= *"|".*$/,""); ver=$0; seen=1}}
+          END{if (named && seen) print ver}' 2>/dev/null) ;;
+      package.json|plugin.json)
+        v=$(printf '%s' "$body" | jq -r --arg c "$c" 'select(.name==$c)|.version // empty' 2>/dev/null) ;;
+      marketplace.json)
+        v=$(printf '%s' "$body" | jq -r --arg c "$c" '.plugins[]?|select(.name==$c)|.version // empty' 2>/dev/null) ;;
+      *)
+        # A resolver script pinning the binary it fetches — the shape that broke cxpak. Only
+        # considered for a file whose own name carries the component's, checked above.
+        v=$(printf '%s' "$body" | awk -F'"' '/^[A-Z_]*REQUIRED_VERSION *= *"/{print $2; exit}') ;;
+    esac
+    case "$v" in
+      [0-9]*.[0-9]*.[0-9]*) printf '%s=%s\n' "$path" "$v" ;;
+    esac
+  done <<< "$paths"
+  return 0
+}
+
 echo "== half 4: the tag's own content agrees with the tag's name"
 # corpus#30's defect class, generalised: a tag named v0.2.0 whose tree declares 0.4.0. Reported
 # as WARN, not FAIL — a red ghost check means "your findings this pass are untrustworthy, stop",
@@ -155,8 +214,17 @@ for c in "${VERSIONED_REPOS[@]}"; do
   tag=$(gh api "repos/$ORG/$c/tags" --jq '.[0].name' 2>/dev/null)
   [ -z "$tag" ] && { note "$c" "WARN no tags at all"; continue; }
   sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null | head -1)
-  v=$(gh api "repos/$ORG/$c/contents/VERSION?ref=$sha" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n ')
-  [ -z "$v" ] && v=$(gh api "repos/$ORG/$c/contents/Cargo.toml?ref=$sha" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | awk -F'"' '/^version/{print $2; exit}')
+  # `|| decls=""` mapped a FAILED tree listing onto the identical state as "the tree was read
+  # and declares nothing", and the message below then asserted a fact about a tree that was
+  # never listed. That is the rule half 5 states, broken by the enumeration half 4 now depends
+  # on: a query that failed is not an empty result. The cost is not a false green — it is a
+  # WARN with the wrong cause, which is how a transient 502 gets filed as a product defect
+  # (.github#15, where a transient 500 accused attestr of unpublished provenance).
+  if ! decls=$(version_declarations "$c" "$sha"); then
+    note "$c" "WARN cannot list $tag's tree — half 4 is UNKNOWN for $c this pass (the API call \
+failed; this says nothing about what the tree declares)"
+    continue
+  fi
   # "Nothing to contradict" was reported as `ok`, and it is not one. The file this half
   # compares against is simply absent at that ref, so the comparison did not happen — a check
   # that could not run is UNKNOWN, not a pass. It fired on two of the nine: cordon and slicr
@@ -171,11 +239,18 @@ for c in "${VERSIONED_REPOS[@]}"; do
   # finding about another wrong. `main`'s value is printed as context, not compared — this
   # half is about the TAG's tree, and a tag whose tree lacks the file cannot be fixed by
   # reading a different ref.
-  if [ -z "$v" ]; then
+  if [ -z "$decls" ]; then
     mv=$(gh api "repos/$ORG/$c/contents/VERSION?ref=main" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n ')
-    note "$c" "WARN $tag declares no version — no VERSION/Cargo.toml at that ref, so the tag-vs-tree claim is UNVERIFIABLE${mv:+ (main says $mv)}"
-  elif [ "$tag" != "v$v" ]; then note "$c" "WARN $tag names a tree that declares $v — a version pin misdescribes what it pins"
-  else note "$c" "ok   $tag == v$v"; fi
+    note "$c" "WARN $tag declares no version anywhere in its tree, so the tag-vs-tree claim is UNVERIFIABLE${mv:+ (main says $mv)}"
+    continue
+  fi
+  n=$(printf '%s\n' "$decls" | grep -c .)
+  bad=$(printf '%s\n' "$decls" | awk -F= -v t="$tag" '"v" $2 != t {printf "%s%s=%s", (c++?", ":""), $1, $2}')
+  # The count is printed on the green line too. "ok" over a subset is what this half used to
+  # say, and the number is the only thing that tells a reader which question was answered.
+  if [ -n "$bad" ]; then
+    note "$c" "WARN $tag names a tree that declares $bad — a version pin misdescribes what it pins ($n declaration(s) compared)"
+  else note "$c" "ok   $tag == every one of $n declaration(s)"; fi
 done
 
 echo "== half 5: currency — merged fixes the release does not contain (advisory, a FLOOR)"
