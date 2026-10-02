@@ -37,6 +37,20 @@
 #
 # Needs: curl, jq, gh. Docker only for --boot.
 # Usage: ./ghost-check.sh [--boot]
+#
+# Exit / outcome (.github#15): a request that never reached the far end at all (DNS, connect,
+# TLS, timeout, reset) is reported UNKNOWN, never FAIL — only a real answer (a status code, a
+# registry verdict) is evidence about the artifact, and 404/401/403 are real answers with their
+# own specific FAIL. UNKNOWN is deliberately a different word from this file's pre-existing
+# advisory WARN (half 4's unverifiable tag-vs-tree claim, half 5's currency gaps): those fire on
+# an ordinary, understood, permanent state of some components (cordon/slicr carry no in-tree
+# version file) and were never meant to block a clean pass; UNKNOWN fires on "the pass itself
+# could not establish an answer" and does.
+#   exit 0  GHOST CHECK GREEN        — every check ran and found nothing wrong
+#   exit 1  GHOST CHECK RED          — at least one check got a real answer that is a defect
+#   exit 2  GHOST CHECK INCONCLUSIVE — no FAIL, but at least one check never got an answer at
+#                                      all; findings from checks that DID run still stand, but
+#                                      nothing here establishes the family is clean — re-run
 
 set -uo pipefail
 
@@ -53,41 +67,100 @@ ACCEPT='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribut
 
 BOOT=0
 [ "${1:-}" = "--boot" ] && BOOT=1
-fail=0
-note() { printf '%-11s %s\n' "$1" "$2"; }
 
 # shellcheck source=./lib/transport.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/transport.sh"
+# shellcheck source=./lib/outcome.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/outcome.sh"
+note_init
 
-ghcr_token() {
-  curl -fsS "https://ghcr.io/token?scope=repository%3A$(echo "$ORG" | tr 'A-Z' 'a-z')%2F${1}%3Apull&service=ghcr.io" | jq -r '.token // empty'
+# .github#15: every curl site below drops `-f`/`-s`-only and reads `-w '%{http_code}'`
+# instead, classified via lib/transport.sh's classify_http_status. Return code convention,
+# shared by every function in this file that talks to ghcr:
+#   0  ok              — stdout carries the parsed value
+#   1  unknown          — no response at all, or a response that is not evidence (429/5xx/…)
+#   2  not_found        — a real 404: no such repository/tag/manifest
+#   3  access_rejected  — a real 401/403: not public
+ghcr_token() { # repo
+  local resp rc status body
+  resp=$(curl -sS -w '\n%{http_code}' \
+    "https://ghcr.io/token?scope=repository%3A$(echo "$ORG" | tr 'A-Z' 'a-z')%2F${1}%3Apull&service=ghcr.io" 2>&1)
+  rc=$?
+  curl_is_transport_failure "$rc" && return 1
+  status=$(printf '%s' "$resp" | tail -1)
+  body=$(printf '%s' "$resp" | sed '$d')
+  case "$(classify_http_status "$status")" in
+    ok) printf '%s' "$body" | jq -r '.token // empty' ;;
+    not_found) return 2 ;;
+    access_rejected) return 3 ;;
+    *) return 1 ;;
+  esac
 }
-# .github#15: no `-f` — curl exits 0 on any HTTP response it gets, including 404/403,
-# and only nonzero when the request never reached the registry at all (see
-# lib/transport.sh). That split is what lets a caller tell "no such manifest" apart
-# from "the request timed out" instead of reading both as the same empty digest.
 digest() { # repo token ref
-  local headers
-  headers=$(curl -sS -o /dev/null -D - -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" \
+  local resp rc status headers
+  resp=$(curl -sS -o /dev/null -D - -w '\n%{http_code}' -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" \
     "https://ghcr.io/v2/barnett-studios/${1}/manifests/${3}" 2>&1)
-  if curl_is_transport_failure $?; then
-    return 1
-  fi
-  printf '%s' "$headers" | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}'
+  rc=$?
+  curl_is_transport_failure "$rc" && return 1
+  status=$(printf '%s' "$resp" | tail -1)
+  headers=$(printf '%s' "$resp" | sed '$d')
+  case "$(classify_http_status "$status")" in
+    ok) printf '%s' "$headers" | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}' ;;
+    not_found) return 2 ;;
+    access_rejected) return 3 ;;
+    *) return 1 ;;
+  esac
 }
 # The config blob carries org.opencontainers.image.* as Labels. The multi-arch index itself
 # carries no annotations, so descend to a real platform manifest first — and skip the
 # attestation manifests, whose platform is literally {os: unknown, architecture: unknown}.
 image_labels() { # repo token ref
-  local idx m mf cfg
-  idx=$(curl -fsS -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" "https://ghcr.io/v2/barnett-studios/${1}/manifests/${3}")
+  local idx_resp idx_rc idx_status idx m mf_resp mf_rc mf_status mf cfg blob_resp blob_rc blob_status blob
+  idx_resp=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" \
+    "https://ghcr.io/v2/barnett-studios/${1}/manifests/${3}" 2>&1)
+  idx_rc=$?
+  curl_is_transport_failure "$idx_rc" && return 1
+  idx_status=$(printf '%s' "$idx_resp" | tail -1)
+  idx=$(printf '%s' "$idx_resp" | sed '$d')
+  case "$(classify_http_status "$idx_status")" in
+    ok) ;;
+    not_found) return 2 ;;
+    access_rejected) return 3 ;;
+    *) return 1 ;;
+  esac
   m=$(echo "$idx" | jq -r 'if .manifests then (.manifests[]|select(.platform.os!="unknown" and .platform.architecture!="unknown")|.digest) else empty end' | head -1)
   if [ -n "$m" ]; then
-    mf=$(curl -fsS -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" "https://ghcr.io/v2/barnett-studios/${1}/manifests/${m}")
-  else mf="$idx"; fi
+    mf_resp=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" \
+      "https://ghcr.io/v2/barnett-studios/${1}/manifests/${m}" 2>&1)
+    mf_rc=$?
+    curl_is_transport_failure "$mf_rc" && return 1
+    mf_status=$(printf '%s' "$mf_resp" | tail -1)
+    mf=$(printf '%s' "$mf_resp" | sed '$d')
+    case "$(classify_http_status "$mf_status")" in
+      ok) ;;
+      not_found) return 2 ;;
+      access_rejected) return 3 ;;
+      *) return 1 ;;
+    esac
+  else
+    mf="$idx"
+  fi
   cfg=$(echo "$mf" | jq -r '.config.digest // empty')
-  [ -z "$cfg" ] && return 1
-  curl -fsSL -H "Authorization: Bearer $2" "https://ghcr.io/v2/barnett-studios/${1}/blobs/${cfg}" | jq -r '.config.Labels // {}'
+  # A real 2xx response with no config digest at all is a genuine absence (a manifest
+  # that is not an image/index this check understands), not a transient — not_found.
+  [ -z "$cfg" ] && return 2
+  blob_resp=$(curl -sS -L -w '\n%{http_code}' -H "Authorization: Bearer $2" \
+    "https://ghcr.io/v2/barnett-studios/${1}/blobs/${cfg}" 2>&1)
+  blob_rc=$?
+  curl_is_transport_failure "$blob_rc" && return 1
+  blob_status=$(printf '%s' "$blob_resp" | tail -1)
+  blob=$(printf '%s' "$blob_resp" | sed '$d')
+  case "$(classify_http_status "$blob_status")" in
+    ok) printf '%s' "$blob" | jq -r '.config.Labels // {}' ;;
+    not_found) return 2 ;;
+    access_rejected) return 3 ;;
+    *) return 1 ;;
+  esac
 }
 newest_semver() { printf '%s\n' "$@" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1; }
 
@@ -99,37 +172,67 @@ vers() { awk -v k="$1" '$1==k{print $2; exit}' "$VERMAP"; }
 
 echo "== half 1: provenance — the image is built from the commit its version tag names"
 for c in "${IMAGES[@]}"; do
-  tok=$(ghcr_token "$c")
-  if [ -z "$tok" ]; then note "$c" "FAIL no anonymous pull token — the image is not public"; fail=1; continue; fi
-  labels=$(image_labels "$c" "$tok" latest) || { note "$c" "FAIL cannot read :latest config — no such tag?"; fail=1; continue; }
+  tok=$(ghcr_token "$c"); rc=$?
+  case $rc in
+    0) ;;
+    2) note "$c" "FAIL no such repository — the image is not public"; continue ;;
+    3) note "$c" "FAIL anonymous pull token rejected — the image is not public"; continue ;;
+    *) note "$c" "UNKNOWN cannot reach ghcr to get a pull token for $c — provenance unknown this pass"; continue ;;
+  esac
+  if [ -z "$tok" ]; then note "$c" "FAIL no anonymous pull token — the image is not public"; continue; fi
+
+  labels=$(image_labels "$c" "$tok" latest); rc=$?
+  case $rc in
+    0) ;;
+    2) note "$c" "FAIL cannot read :latest config — no such tag"; continue ;;
+    3) note "$c" "FAIL :latest config access rejected — the image is not public"; continue ;;
+    *) note "$c" "UNKNOWN cannot reach ghcr to read :latest config for $c — provenance unknown this pass"; continue ;;
+  esac
   ver=$(echo "$labels" | jq -r '."org.opencontainers.image.version" // empty')
   rev=$(echo "$labels" | jq -r '."org.opencontainers.image.revision" // empty')
   if [ -z "$ver" ] || [ -z "$rev" ]; then
-    note "$c" "FAIL :latest carries no image.version/revision label — provenance unverifiable"; fail=1; continue
+    note "$c" "FAIL :latest carries no image.version/revision label — provenance unverifiable"; continue
   fi
   echo "$c $ver" >> "$VERMAP"
-  # /tags returns commit.sha already peeled through annotated tags. Status read
-  # before the pipe to `head`, not after — `| head -1` takes head's exit status (0
-  # regardless of gh), the same trap .github#11 fixed in half 5 (.github#15).
-  if ! tagsha_all=$(gh api "repos/$ORG/$c/tags" --paginate --jq ".[]|select(.name==\"v${ver}\")|.commit.sha" 2>/dev/null); then
-    note "$c" "WARN cannot query tags for $c — provenance unknown this pass (the API call failed; this says nothing about whether v$ver exists)"; continue
+
+  # /tags returns commit.sha already peeled through annotated tags. `-i` is what
+  # exposes the status even on a non-2xx (.github#15) — a 404 here means the
+  # repository itself does not exist (a real finding); 429/5xx/no-response at all
+  # is UNKNOWN. Status read before any pipe to `head`, not after: `| head -1` takes
+  # head's exit status (0 regardless of gh), the same trap .github#11 fixed in half 5.
+  if ! raw=$(gh_api_raw "repos/$ORG/$c/tags" --paginate --jq ".[]|select(.name==\"v${ver}\")|.commit.sha"); then
+    note "$c" "UNKNOWN cannot query tags for $c — provenance unknown this pass (no response at all)"; continue
   fi
-  tagsha=$(printf '%s\n' "$tagsha_all" | head -1)
+  status=$(printf '%s\n' "$raw" | head -1)
+  case "$(classify_http_status "$status")" in
+    ok) tagsha=$(printf '%s\n' "$raw" | tail -n +2 | head -1) ;;
+    not_found) note "$c" "FAIL repos/$ORG/$c does not exist — an image nobody can trace to source"; continue ;;
+    *) note "$c" "UNKNOWN cannot query tags for $c — provenance unknown this pass (status=$status)"; continue ;;
+  esac
   if [ -z "$tagsha" ]; then
-    note "$c" "FAIL :latest claims $ver but no tag v$ver exists — an image nobody can trace to source"; fail=1; continue
+    note "$c" "FAIL :latest claims $ver but no tag v$ver exists — an image nobody can trace to source"; continue
   fi
   if [ "$rev" != "$tagsha" ]; then
-    note "$c" "FAIL :latest($ver) built from ${rev:0:12} but v$ver is ${tagsha:0:12} — image and tag disagree"; fail=1; continue
+    note "$c" "FAIL :latest($ver) built from ${rev:0:12} but v$ver is ${tagsha:0:12} — image and tag disagree"; continue
   fi
-  # .github#15: a transient 500 here used to print straight into the FAIL message
-  # (`status=`, the error body, or empty) instead of being recognised as a query
-  # that never ran. `if ! x=$(...)` reads gh's own exit status, not the body.
-  if ! onmain=$(gh api "repos/$ORG/$c/compare/main...${rev}" --jq '.status' 2>/dev/null); then
-    note "$c" "WARN cannot compare ${rev:0:12} against main — provenance unknown this pass (the API call failed; this says nothing about whether the commit is an ancestor)"; continue
+
+  # A 404 here means `rev` (or `main`) does not exist at all — a real, different
+  # finding from "exists but diverged" (a 200 whose .status is neither identical nor
+  # behind, handled below). 429/5xx/no-response is UNKNOWN, never a silent FAIL — a
+  # transient 500 used to print straight into the FAIL message (`status=`, the error
+  # body, or empty) with nothing to tell it apart from a real divergence (.github#15).
+  if ! raw=$(gh_api_raw "repos/$ORG/$c/compare/main...${rev}" --jq '.status'); then
+    note "$c" "UNKNOWN cannot compare ${rev:0:12} against main — provenance unknown this pass (no response at all)"; continue
   fi
+  status=$(printf '%s\n' "$raw" | head -1)
+  case "$(classify_http_status "$status")" in
+    ok) onmain=$(printf '%s\n' "$raw" | tail -n +2 | head -1) ;;
+    not_found) note "$c" "FAIL ${rev:0:12} does not exist on $c — the published commit is unreachable"; continue ;;
+    *) note "$c" "UNKNOWN cannot compare ${rev:0:12} against main — provenance unknown this pass (status=$status)"; continue ;;
+  esac
   case "$onmain" in
     identical|behind) ;;
-    *) note "$c" "FAIL the published commit ${rev:0:12} is not an ancestor of main (status=$onmain)"; fail=1; continue ;;
+    *) note "$c" "FAIL the published commit ${rev:0:12} is not an ancestor of main (status=$onmain)"; continue ;;
   esac
   lag=$(gh api "repos/$ORG/$c/compare/v${ver}...main" --jq '.ahead_by' 2>/dev/null)
   note "$c" "ok   v$ver @ ${rev:0:12} on main · main is +${lag:-?} commits (advisory)"
@@ -137,28 +240,56 @@ done
 
 echo "== half 2: reach — what an anonymous \`docker pull\` actually resolves"
 for c in "${IMAGES[@]}"; do
-  tok=$(ghcr_token "$c"); [ -z "$tok" ] && continue
-  # .github#15: no `-f` here either, same reason as digest() — curl's own exit code
-  # tells us whether the registry answered at all; an empty tag list from a real
-  # answer (a legitimate "no tags") must not read the same as a request that never
-  # landed.
-  tags_body=$(curl -sS -H "Authorization: Bearer $tok" "https://ghcr.io/v2/barnett-studios/${c}/tags/list" 2>&1)
-  if curl_is_transport_failure $?; then
-    note "$c" "WARN cannot reach the registry to list tags for $c — reach unknown this pass"; continue
+  tok=$(ghcr_token "$c"); rc=$?
+  case $rc in
+    0) ;;
+    2) note "$c" "FAIL no such repository — the image is not public"; continue ;;
+    3) note "$c" "FAIL anonymous pull token rejected — the image is not public"; continue ;;
+    *) note "$c" "UNKNOWN cannot reach ghcr to get a pull token for $c — reach unknown this pass"; continue ;;
+  esac
+  [ -z "$tok" ] && continue
+
+  # .github#15: no `-f` here either, same reason as ghcr_token()/digest() — curl's
+  # own exit code only tells us whether the registry answered AT ALL; the status
+  # (via `-w`) tells us what it answered. A real empty tag list (a legitimate "no
+  # tags", 200) must not read the same as a 404 (no such repository) or a request
+  # that never landed.
+  resp=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $tok" \
+    "https://ghcr.io/v2/barnett-studios/${c}/tags/list" 2>&1)
+  rc=$?
+  if curl_is_transport_failure "$rc"; then
+    note "$c" "UNKNOWN cannot reach the registry to list tags for $c — reach unknown this pass"; continue
   fi
-  tags=$(printf '%s' "$tags_body" | jq -r '.tags[]?' 2>/dev/null)
+  status=$(printf '%s' "$resp" | tail -1)
+  tags_body=$(printf '%s' "$resp" | sed '$d')
+  case "$(classify_http_status "$status")" in
+    ok) tags=$(printf '%s' "$tags_body" | jq -r '.tags[]?' 2>/dev/null) ;;
+    not_found) note "$c" "FAIL no such repository on ghcr — the README's docker pull gets nothing"; continue ;;
+    access_rejected) note "$c" "FAIL tags list access rejected for $c — the image is not public"; continue ;;
+    *) note "$c" "UNKNOWN cannot reach the registry to list tags for $c — reach unknown this pass (status=$status)"; continue ;;
+  esac
   newest=$(newest_semver $tags)
-  [ -z "$newest" ] && { note "$c" "FAIL no semver tag published"; fail=1; continue; }
-  if ! dl=$(digest "$c" "$tok" latest); then
-    note "$c" "WARN cannot reach :latest manifest for $c — reach unknown this pass"; continue
-  fi
-  if ! dn=$(digest "$c" "$tok" "$newest"); then
-    note "$c" "WARN cannot reach :$newest manifest for $c — reach unknown this pass"; continue
-  fi
-  if [ -z "$dl" ]; then note "$c" "FAIL no :latest — the README's docker pull gets nothing"; fail=1
-  elif [ "$dl" != "$dn" ]; then note "$c" "FAIL :latest is STALE vs $newest — consumers silently receive an older image"; fail=1
+  [ -z "$newest" ] && { note "$c" "FAIL no semver tag published"; continue; }
+
+  dl=$(digest "$c" "$tok" latest); rc=$?
+  case $rc in
+    0) ;;
+    2) note "$c" "FAIL no :latest manifest — the README's docker pull gets nothing"; continue ;;
+    3) note "$c" "FAIL :latest manifest access rejected for $c — the image is not public"; continue ;;
+    *) note "$c" "UNKNOWN cannot reach :latest manifest for $c — reach unknown this pass"; continue ;;
+  esac
+  dn=$(digest "$c" "$tok" "$newest"); rc=$?
+  case $rc in
+    0) ;;
+    2) note "$c" "FAIL no :$newest manifest — a published tag with no manifest"; continue ;;
+    3) note "$c" "FAIL :$newest manifest access rejected for $c — the image is not public"; continue ;;
+    *) note "$c" "UNKNOWN cannot reach :$newest manifest for $c — reach unknown this pass"; continue ;;
+  esac
+
+  if [ -z "$dl" ]; then note "$c" "FAIL no :latest — the README's docker pull gets nothing"
+  elif [ "$dl" != "$dn" ]; then note "$c" "FAIL :latest is STALE vs $newest — consumers silently receive an older image"
   elif [ -n "$(vers "$c")" ] && [ "$newest" != "$(vers "$c")" ]; then
-    note "$c" "FAIL :latest labels itself $(vers "$c") but $newest is published — latest is not the newest"; fail=1
+    note "$c" "FAIL :latest labels itself $(vers "$c") but $newest is published — latest is not the newest"
   else note "$c" "ok   :latest == :$newest (${dl:0:19})"; fi
 done
 
@@ -379,13 +510,17 @@ if [ "$BOOT" = 1 ]; then
     img="ghcr.io/barnett-studios/${c}:latest"
     # .github#15: a transient transport failure (TLS handshake timeout, connection
     # reset, i/o timeout — measured hitting this exact line at ~8% per request) is
-    # not evidence the image is private; only denied/unauthorized/403 is. Read the
-    # error rather than treat every nonzero pull the same.
+    # not evidence about the image at all. "manifest unknown"/"name unknown"/"not
+    # found" is a real "no such image" answer; denied/unauthorized/a literal 403 or
+    # 401 status is a real access rejection. Read the error rather than treat every
+    # nonzero pull the same.
     if ! pull_out=$(docker pull "$img" 2>&1); then
-      if docker_pull_is_access_rejection "$pull_out"; then
-        note "$c" "FAIL anonymous docker pull rejected: $(printf '%s' "$pull_out" | tail -1)"; fail=1; continue
+      if docker_pull_is_not_found "$pull_out"; then
+        note "$c" "FAIL anonymous docker pull: no such image/tag: $(printf '%s' "$pull_out" | tail -1)"; continue
+      elif docker_pull_is_access_rejection "$pull_out"; then
+        note "$c" "FAIL anonymous docker pull rejected: $(printf '%s' "$pull_out" | tail -1)"; continue
       else
-        note "$c" "WARN cannot reach the registry to pull $c — reach unknown this pass: $(printf '%s' "$pull_out" | tail -1)"; continue
+        note "$c" "UNKNOWN cannot reach the registry to pull $c — reach unknown this pass: $(printf '%s' "$pull_out" | tail -1)"; continue
       fi
     fi
     if [ "$c" = cordon ]; then
@@ -417,6 +552,9 @@ if [ "$BOOT" = 1 ]; then
 fi
 
 echo
-[ "$fail" = 0 ] && echo "GHOST CHECK GREEN" \
-  || echo "GHOST CHECK RED — stop and report; do not file product findings against this state"
-exit "$fail"
+# .github#15: GREEN must mean every check ran and found nothing wrong — not "nothing
+# that ran found anything wrong". A pass where some check never got an answer at all
+# is not evidence the family is clean; it is evidence this pass didn't finish asking.
+# ghost_check_outcome (qa/lib/outcome.sh) is the tested decision; this just applies it.
+ghost_check_outcome
+exit $?
