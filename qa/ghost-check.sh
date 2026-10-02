@@ -56,13 +56,24 @@ BOOT=0
 fail=0
 note() { printf '%-11s %s\n' "$1" "$2"; }
 
+# shellcheck source=./lib/transport.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/transport.sh"
+
 ghcr_token() {
   curl -fsS "https://ghcr.io/token?scope=repository%3A$(echo "$ORG" | tr 'A-Z' 'a-z')%2F${1}%3Apull&service=ghcr.io" | jq -r '.token // empty'
 }
+# .github#15: no `-f` — curl exits 0 on any HTTP response it gets, including 404/403,
+# and only nonzero when the request never reached the registry at all (see
+# lib/transport.sh). That split is what lets a caller tell "no such manifest" apart
+# from "the request timed out" instead of reading both as the same empty digest.
 digest() { # repo token ref
-  curl -fsS -o /dev/null -D - -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" \
-    "https://ghcr.io/v2/barnett-studios/${1}/manifests/${3}" \
-    | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}'
+  local headers
+  headers=$(curl -sS -o /dev/null -D - -H "Authorization: Bearer $2" -H "Accept: $ACCEPT" \
+    "https://ghcr.io/v2/barnett-studios/${1}/manifests/${3}" 2>&1)
+  if curl_is_transport_failure $?; then
+    return 1
+  fi
+  printf '%s' "$headers" | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}'
 }
 # The config blob carries org.opencontainers.image.* as Labels. The multi-arch index itself
 # carries no annotations, so descend to a real platform manifest first — and skip the
@@ -97,15 +108,25 @@ for c in "${IMAGES[@]}"; do
     note "$c" "FAIL :latest carries no image.version/revision label — provenance unverifiable"; fail=1; continue
   fi
   echo "$c $ver" >> "$VERMAP"
-  # /tags returns commit.sha already peeled through annotated tags.
-  tagsha=$(gh api "repos/$ORG/$c/tags" --paginate --jq ".[]|select(.name==\"v${ver}\")|.commit.sha" 2>/dev/null | head -1)
+  # /tags returns commit.sha already peeled through annotated tags. Status read
+  # before the pipe to `head`, not after — `| head -1` takes head's exit status (0
+  # regardless of gh), the same trap .github#11 fixed in half 5 (.github#15).
+  if ! tagsha_all=$(gh api "repos/$ORG/$c/tags" --paginate --jq ".[]|select(.name==\"v${ver}\")|.commit.sha" 2>/dev/null); then
+    note "$c" "WARN cannot query tags for $c — provenance unknown this pass (the API call failed; this says nothing about whether v$ver exists)"; continue
+  fi
+  tagsha=$(printf '%s\n' "$tagsha_all" | head -1)
   if [ -z "$tagsha" ]; then
     note "$c" "FAIL :latest claims $ver but no tag v$ver exists — an image nobody can trace to source"; fail=1; continue
   fi
   if [ "$rev" != "$tagsha" ]; then
     note "$c" "FAIL :latest($ver) built from ${rev:0:12} but v$ver is ${tagsha:0:12} — image and tag disagree"; fail=1; continue
   fi
-  onmain=$(gh api "repos/$ORG/$c/compare/main...${rev}" --jq '.status' 2>/dev/null)
+  # .github#15: a transient 500 here used to print straight into the FAIL message
+  # (`status=`, the error body, or empty) instead of being recognised as a query
+  # that never ran. `if ! x=$(...)` reads gh's own exit status, not the body.
+  if ! onmain=$(gh api "repos/$ORG/$c/compare/main...${rev}" --jq '.status' 2>/dev/null); then
+    note "$c" "WARN cannot compare ${rev:0:12} against main — provenance unknown this pass (the API call failed; this says nothing about whether the commit is an ancestor)"; continue
+  fi
   case "$onmain" in
     identical|behind) ;;
     *) note "$c" "FAIL the published commit ${rev:0:12} is not an ancestor of main (status=$onmain)"; fail=1; continue ;;
@@ -117,10 +138,23 @@ done
 echo "== half 2: reach — what an anonymous \`docker pull\` actually resolves"
 for c in "${IMAGES[@]}"; do
   tok=$(ghcr_token "$c"); [ -z "$tok" ] && continue
-  tags=$(curl -fsS -H "Authorization: Bearer $tok" "https://ghcr.io/v2/barnett-studios/${c}/tags/list" | jq -r '.tags[]?')
+  # .github#15: no `-f` here either, same reason as digest() — curl's own exit code
+  # tells us whether the registry answered at all; an empty tag list from a real
+  # answer (a legitimate "no tags") must not read the same as a request that never
+  # landed.
+  tags_body=$(curl -sS -H "Authorization: Bearer $tok" "https://ghcr.io/v2/barnett-studios/${c}/tags/list" 2>&1)
+  if curl_is_transport_failure $?; then
+    note "$c" "WARN cannot reach the registry to list tags for $c — reach unknown this pass"; continue
+  fi
+  tags=$(printf '%s' "$tags_body" | jq -r '.tags[]?' 2>/dev/null)
   newest=$(newest_semver $tags)
   [ -z "$newest" ] && { note "$c" "FAIL no semver tag published"; fail=1; continue; }
-  dl=$(digest "$c" "$tok" latest); dn=$(digest "$c" "$tok" "$newest")
+  if ! dl=$(digest "$c" "$tok" latest); then
+    note "$c" "WARN cannot reach :latest manifest for $c — reach unknown this pass"; continue
+  fi
+  if ! dn=$(digest "$c" "$tok" "$newest"); then
+    note "$c" "WARN cannot reach :$newest manifest for $c — reach unknown this pass"; continue
+  fi
   if [ -z "$dl" ]; then note "$c" "FAIL no :latest — the README's docker pull gets nothing"; fail=1
   elif [ "$dl" != "$dn" ]; then note "$c" "FAIL :latest is STALE vs $newest — consumers silently receive an older image"; fail=1
   elif [ -n "$(vers "$c")" ] && [ "$newest" != "$(vers "$c")" ]; then
@@ -343,7 +377,17 @@ if [ "$BOOT" = 1 ]; then
     # is indistinguishable from a private image. Cost this check an hour and a whole false
     # theory about stale docker credentials.
     img="ghcr.io/barnett-studios/${c}:latest"
-    docker pull "$img" >/dev/null 2>&1 || { note "$c" "FAIL anonymous docker pull rejected"; fail=1; continue; }
+    # .github#15: a transient transport failure (TLS handshake timeout, connection
+    # reset, i/o timeout — measured hitting this exact line at ~8% per request) is
+    # not evidence the image is private; only denied/unauthorized/403 is. Read the
+    # error rather than treat every nonzero pull the same.
+    if ! pull_out=$(docker pull "$img" 2>&1); then
+      if docker_pull_is_access_rejection "$pull_out"; then
+        note "$c" "FAIL anonymous docker pull rejected: $(printf '%s' "$pull_out" | tail -1)"; fail=1; continue
+      else
+        note "$c" "WARN cannot reach the registry to pull $c — reach unknown this pass: $(printf '%s' "$pull_out" | tail -1)"; continue
+      fi
+    fi
     if [ "$c" = cordon ]; then
       # cordon's image is deliberately NOT a CLI: it is the swappable <runtime> argument to
       # cordon-run.sh, documented as `git + python3 + build-essential` with no entrypoint.
