@@ -175,23 +175,23 @@ for c in "${IMAGES[@]}"; do
   tok=$(ghcr_token "$c"); rc=$?
   case $rc in
     0) ;;
-    2) note "$c" "FAIL no such repository — the image is not public"; continue ;;
-    3) note "$c" "FAIL anonymous pull token rejected — the image is not public"; continue ;;
-    *) note "$c" "UNKNOWN cannot reach ghcr to get a pull token for $c — provenance unknown this pass"; continue ;;
+    2) note "$c" FAIL "no such repository — the image is not public"; continue ;;
+    3) note "$c" FAIL "anonymous pull token rejected — the image is not public"; continue ;;
+    *) note "$c" UNKNOWN "cannot reach ghcr to get a pull token for $c — provenance unknown this pass"; continue ;;
   esac
-  if [ -z "$tok" ]; then note "$c" "FAIL no anonymous pull token — the image is not public"; continue; fi
+  if [ -z "$tok" ]; then note "$c" FAIL "no anonymous pull token — the image is not public"; continue; fi
 
   labels=$(image_labels "$c" "$tok" latest); rc=$?
   case $rc in
     0) ;;
-    2) note "$c" "FAIL cannot read :latest config — no such tag"; continue ;;
-    3) note "$c" "FAIL :latest config access rejected — the image is not public"; continue ;;
-    *) note "$c" "UNKNOWN cannot reach ghcr to read :latest config for $c — provenance unknown this pass"; continue ;;
+    2) note "$c" FAIL "cannot read :latest config — no such tag"; continue ;;
+    3) note "$c" FAIL ":latest config access rejected — the image is not public"; continue ;;
+    *) note "$c" UNKNOWN "cannot reach ghcr to read :latest config for $c — provenance unknown this pass"; continue ;;
   esac
   ver=$(echo "$labels" | jq -r '."org.opencontainers.image.version" // empty')
   rev=$(echo "$labels" | jq -r '."org.opencontainers.image.revision" // empty')
   if [ -z "$ver" ] || [ -z "$rev" ]; then
-    note "$c" "FAIL :latest carries no image.version/revision label — provenance unverifiable"; continue
+    note "$c" FAIL ":latest carries no image.version/revision label — provenance unverifiable"; continue
   fi
   echo "$c $ver" >> "$VERMAP"
 
@@ -201,19 +201,19 @@ for c in "${IMAGES[@]}"; do
   # is UNKNOWN. Status read before any pipe to `head`, not after: `| head -1` takes
   # head's exit status (0 regardless of gh), the same trap .github#11 fixed in half 5.
   if ! raw=$(gh_api_raw "repos/$ORG/$c/tags" --paginate --jq ".[]|select(.name==\"v${ver}\")|.commit.sha"); then
-    note "$c" "UNKNOWN cannot query tags for $c — provenance unknown this pass (no response at all)"; continue
+    note "$c" UNKNOWN "cannot query tags for $c — provenance unknown this pass (no response at all)"; continue
   fi
   status=$(printf '%s\n' "$raw" | head -1)
   case "$(classify_http_status "$status")" in
     ok) tagsha=$(printf '%s\n' "$raw" | tail -n +2 | head -1) ;;
-    not_found) note "$c" "FAIL repos/$ORG/$c does not exist — an image nobody can trace to source"; continue ;;
-    *) note "$c" "UNKNOWN cannot query tags for $c — provenance unknown this pass (status=$status)"; continue ;;
+    not_found) note "$c" FAIL "repos/$ORG/$c does not exist — an image nobody can trace to source"; continue ;;
+    *) note "$c" UNKNOWN "cannot query tags for $c — provenance unknown this pass (status=$status)"; continue ;;
   esac
   if [ -z "$tagsha" ]; then
-    note "$c" "FAIL :latest claims $ver but no tag v$ver exists — an image nobody can trace to source"; continue
+    note "$c" FAIL ":latest claims $ver but no tag v$ver exists — an image nobody can trace to source"; continue
   fi
   if [ "$rev" != "$tagsha" ]; then
-    note "$c" "FAIL :latest($ver) built from ${rev:0:12} but v$ver is ${tagsha:0:12} — image and tag disagree"; continue
+    note "$c" FAIL ":latest($ver) built from ${rev:0:12} but v$ver is ${tagsha:0:12} — image and tag disagree"; continue
   fi
 
   # A 404 here means `rev` (or `main`) does not exist at all — a real, different
@@ -222,20 +222,20 @@ for c in "${IMAGES[@]}"; do
   # transient 500 used to print straight into the FAIL message (`status=`, the error
   # body, or empty) with nothing to tell it apart from a real divergence (.github#15).
   if ! raw=$(gh_api_raw "repos/$ORG/$c/compare/main...${rev}" --jq '.status'); then
-    note "$c" "UNKNOWN cannot compare ${rev:0:12} against main — provenance unknown this pass (no response at all)"; continue
+    note "$c" UNKNOWN "cannot compare ${rev:0:12} against main — provenance unknown this pass (no response at all)"; continue
   fi
   status=$(printf '%s\n' "$raw" | head -1)
   case "$(classify_http_status "$status")" in
     ok) onmain=$(printf '%s\n' "$raw" | tail -n +2 | head -1) ;;
-    not_found) note "$c" "FAIL ${rev:0:12} does not exist on $c — the published commit is unreachable"; continue ;;
-    *) note "$c" "UNKNOWN cannot compare ${rev:0:12} against main — provenance unknown this pass (status=$status)"; continue ;;
+    not_found) note "$c" FAIL "${rev:0:12} does not exist on $c — the published commit is unreachable"; continue ;;
+    *) note "$c" UNKNOWN "cannot compare ${rev:0:12} against main — provenance unknown this pass (status=$status)"; continue ;;
   esac
   case "$onmain" in
     identical|behind) ;;
-    *) note "$c" "FAIL the published commit ${rev:0:12} is not an ancestor of main (status=$onmain)"; continue ;;
+    *) note "$c" FAIL "the published commit ${rev:0:12} is not an ancestor of main (status=$onmain)"; continue ;;
   esac
   lag=$(gh api "repos/$ORG/$c/compare/v${ver}...main" --jq '.ahead_by' 2>/dev/null)
-  note "$c" "ok   v$ver @ ${rev:0:12} on main · main is +${lag:-?} commits (advisory)"
+  note "$c" ok "v$ver @ ${rev:0:12} on main · main is +${lag:-?} commits (advisory)"
 done
 
 echo "== half 2: reach — what an anonymous \`docker pull\` actually resolves"
@@ -243,9 +243,9 @@ for c in "${IMAGES[@]}"; do
   tok=$(ghcr_token "$c"); rc=$?
   case $rc in
     0) ;;
-    2) note "$c" "FAIL no such repository — the image is not public"; continue ;;
-    3) note "$c" "FAIL anonymous pull token rejected — the image is not public"; continue ;;
-    *) note "$c" "UNKNOWN cannot reach ghcr to get a pull token for $c — reach unknown this pass"; continue ;;
+    2) note "$c" FAIL "no such repository — the image is not public"; continue ;;
+    3) note "$c" FAIL "anonymous pull token rejected — the image is not public"; continue ;;
+    *) note "$c" UNKNOWN "cannot reach ghcr to get a pull token for $c — reach unknown this pass"; continue ;;
   esac
   [ -z "$tok" ] && continue
 
@@ -258,57 +258,73 @@ for c in "${IMAGES[@]}"; do
     "https://ghcr.io/v2/barnett-studios/${c}/tags/list" 2>&1)
   rc=$?
   if curl_is_transport_failure "$rc"; then
-    note "$c" "UNKNOWN cannot reach the registry to list tags for $c — reach unknown this pass"; continue
+    note "$c" UNKNOWN "cannot reach the registry to list tags for $c — reach unknown this pass"; continue
   fi
   status=$(printf '%s' "$resp" | tail -1)
   tags_body=$(printf '%s' "$resp" | sed '$d')
   case "$(classify_http_status "$status")" in
     ok) tags=$(printf '%s' "$tags_body" | jq -r '.tags[]?' 2>/dev/null) ;;
-    not_found) note "$c" "FAIL no such repository on ghcr — the README's docker pull gets nothing"; continue ;;
-    access_rejected) note "$c" "FAIL tags list access rejected for $c — the image is not public"; continue ;;
-    *) note "$c" "UNKNOWN cannot reach the registry to list tags for $c — reach unknown this pass (status=$status)"; continue ;;
+    not_found) note "$c" FAIL "no such repository on ghcr — the README's docker pull gets nothing"; continue ;;
+    access_rejected) note "$c" FAIL "tags list access rejected for $c — the image is not public"; continue ;;
+    *) note "$c" UNKNOWN "cannot reach the registry to list tags for $c — reach unknown this pass (status=$status)"; continue ;;
   esac
   newest=$(newest_semver $tags)
-  [ -z "$newest" ] && { note "$c" "FAIL no semver tag published"; continue; }
+  [ -z "$newest" ] && { note "$c" FAIL "no semver tag published"; continue; }
 
   dl=$(digest "$c" "$tok" latest); rc=$?
   case $rc in
     0) ;;
-    2) note "$c" "FAIL no :latest manifest — the README's docker pull gets nothing"; continue ;;
-    3) note "$c" "FAIL :latest manifest access rejected for $c — the image is not public"; continue ;;
-    *) note "$c" "UNKNOWN cannot reach :latest manifest for $c — reach unknown this pass"; continue ;;
+    2) note "$c" FAIL "no :latest manifest — the README's docker pull gets nothing"; continue ;;
+    3) note "$c" FAIL ":latest manifest access rejected for $c — the image is not public"; continue ;;
+    *) note "$c" UNKNOWN "cannot reach :latest manifest for $c — reach unknown this pass"; continue ;;
   esac
   dn=$(digest "$c" "$tok" "$newest"); rc=$?
   case $rc in
     0) ;;
-    2) note "$c" "FAIL no :$newest manifest — a published tag with no manifest"; continue ;;
-    3) note "$c" "FAIL :$newest manifest access rejected for $c — the image is not public"; continue ;;
-    *) note "$c" "UNKNOWN cannot reach :$newest manifest for $c — reach unknown this pass"; continue ;;
+    2) note "$c" FAIL "no :$newest manifest — a published tag with no manifest"; continue ;;
+    3) note "$c" FAIL ":$newest manifest access rejected for $c — the image is not public"; continue ;;
+    *) note "$c" UNKNOWN "cannot reach :$newest manifest for $c — reach unknown this pass"; continue ;;
   esac
 
-  if [ -z "$dl" ]; then note "$c" "FAIL no :latest — the README's docker pull gets nothing"
-  elif [ "$dl" != "$dn" ]; then note "$c" "FAIL :latest is STALE vs $newest — consumers silently receive an older image"
+  if [ -z "$dl" ]; then note "$c" FAIL "no :latest — the README's docker pull gets nothing"
+  elif [ "$dl" != "$dn" ]; then note "$c" FAIL ":latest is STALE vs $newest — consumers silently receive an older image"
   elif [ -n "$(vers "$c")" ] && [ "$newest" != "$(vers "$c")" ]; then
-    note "$c" "FAIL :latest labels itself $(vers "$c") but $newest is published — latest is not the newest"
-  else note "$c" "ok   :latest == :$newest (${dl:0:19})"; fi
+    note "$c" FAIL ":latest labels itself $(vers "$c") but $newest is published — latest is not the newest"
+  else note "$c" ok ":latest == :$newest (${dl:0:19})"; fi
 done
 
 echo "== half 3: crates.io — the published crate matches the tag and is not yanked"
 for c in "${CRATES[@]}"; do
-  j=$(curl -fsS "https://crates.io/api/v1/crates/$c" -H 'User-Agent: barnett-studios-qa')
+  # .github#15 review requirement 2: this site was still `curl -fsS` with no status
+  # read — a transient failure returned empty `$j`, `repo` parsed out of it as
+  # empty, and the name-collision guard below turned "crates.io didn't answer" into
+  # a real-sounding "points at '' — not this org's crate" FAIL. Same `-w`/classify
+  # treatment as every other curl site in this file.
+  resp=$(curl -sS -w '\n%{http_code}' "https://crates.io/api/v1/crates/$c" -H 'User-Agent: barnett-studios-qa' 2>&1)
+  rc=$?
+  if curl_is_transport_failure "$rc"; then
+    note "$c" UNKNOWN "cannot reach crates.io for $c — crate check unknown this pass"; continue
+  fi
+  status=$(printf '%s' "$resp" | tail -1)
+  j=$(printf '%s' "$resp" | sed '$d')
+  case "$(classify_http_status "$status")" in
+    ok) ;;
+    not_found) note "$c" FAIL "crates.io has no crate named $c"; continue ;;
+    *) note "$c" UNKNOWN "crates.io returned status=$status for $c — crate check unknown this pass"; continue ;;
+  esac
   repo=$(echo "$j" | jq -r '.crate.repository // ""')
   # Guard against name collisions with unrelated crates before believing any version.
   case "$repo" in
     *"github.com/$ORG/$c"*) ;;
-    *) note "$c" "FAIL crates.io/$c points at '$repo' — not this org's crate"; fail=1; continue ;;
+    *) note "$c" FAIL "crates.io/$c points at '$repo' — not this org's crate"; continue ;;
   esac
   max=$(echo "$j" | jq -r '.crate.max_version')
   yanked=$(echo "$j" | jq -r '[.versions[]|select(.yanked)|.num]|join(",")')
   want=$(vers "$c")
   if [ -n "$want" ] && [ "$max" != "$want" ]; then
-    note "$c" "FAIL crates.io has $max but the published image is $want — the two consumer paths disagree"; fail=1
-  elif [ -n "$yanked" ]; then note "$c" "ok   $max (yanked in line: $yanked)"
-  else note "$c" "ok   $max"; fi
+    note "$c" FAIL "crates.io has $max but the published image is $want — the two consumer paths disagree"
+  elif [ -n "$yanked" ]; then note "$c" ok "$max (yanked in line: $yanked)"
+  else note "$c" ok "$max"; fi
 done
 
 # Every place the tag's tree declares THIS component's OWN version, as `path=version` lines.
@@ -376,17 +392,31 @@ echo "== half 4: the tag's own content agrees with the tag's name"
 # and corpus tag drift does not make a finding about cascadr wrong. Gating every future pass on
 # an already-filed product defect trains the loop to ignore its own red.
 for c in "${VERSIONED_REPOS[@]}"; do
-  tag=$(gh api "repos/$ORG/$c/tags" --jq '.[0].name' 2>/dev/null)
-  [ -z "$tag" ] && { note "$c" "WARN no tags at all"; continue; }
-  sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null | head -1)
+  # .github#15 review requirement 5: both lookups below were unguarded `gh api`
+  # calls with no status read at all — the exact bug class this whole file exists
+  # to fix, just not yet applied here. A failed call leaves its raw error JSON on
+  # stdout (gh does not apply --jq on a non-2xx); `tag`/`sha` would then be that
+  # JSON blob rather than empty, so `[ -z ]` misses it and the next lookup searches
+  # for a tag literally named the error body. Guarded the same way half 1 already
+  # is: `if ! x=$(...)` reads gh's own exit status, never the body.
+  if ! tag=$(gh api "repos/$ORG/$c/tags" --jq '.[0].name' 2>/dev/null); then
+    note "$c" UNKNOWN "cannot list tags for $c — half 4 unknown this pass (no response at all)"; continue
+  fi
+  [ -z "$tag" ] && { note "$c" WARN "no tags at all"; continue; }
+  if ! sha_all=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null); then
+    note "$c" UNKNOWN "cannot resolve $tag to a commit for $c — half 4 unknown this pass (no response at all)"; continue
+  fi
+  sha=$(printf '%s\n' "$sha_all" | head -1)
   # `|| decls=""` mapped a FAILED tree listing onto the identical state as "the tree was read
   # and declares nothing", and the message below then asserted a fact about a tree that was
   # never listed. That is the rule half 5 states, broken by the enumeration half 4 now depends
   # on: a query that failed is not an empty result. The cost is not a false green — it is a
   # WARN with the wrong cause, which is how a transient 502 gets filed as a product defect
-  # (.github#15, where a transient 500 accused attestr of unpublished provenance).
+  # (.github#15, where a transient 500 accused attestr of unpublished provenance). Reported as
+  # UNKNOWN, not WARN (review requirement 5): this is a genuine transient request failure, not
+  # the permanent "no version file in this tree" state the WARN two blocks down reports.
   if ! decls=$(version_declarations "$c" "$sha"); then
-    note "$c" "WARN cannot list $tag's tree — half 4 is UNKNOWN for $c this pass (the API call \
+    note "$c" UNKNOWN "cannot list $tag's tree for $c — half 4 unknown this pass (the API call \
 failed; this says nothing about what the tree declares)"
     continue
   fi
@@ -406,7 +436,7 @@ failed; this says nothing about what the tree declares)"
   # reading a different ref.
   if [ -z "$decls" ]; then
     mv=$(gh api "repos/$ORG/$c/contents/VERSION?ref=main" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n ')
-    note "$c" "WARN $tag declares no version anywhere in its tree, so the tag-vs-tree claim is UNVERIFIABLE${mv:+ (main says $mv)}"
+    note "$c" WARN "$tag declares no version anywhere in its tree, so the tag-vs-tree claim is UNVERIFIABLE${mv:+ (main says $mv)}"
     continue
   fi
   n=$(printf '%s\n' "$decls" | grep -c .)
@@ -414,8 +444,8 @@ failed; this says nothing about what the tree declares)"
   # The count is printed on the green line too. "ok" over a subset is what this half used to
   # say, and the number is the only thing that tells a reader which question was answered.
   if [ -n "$bad" ]; then
-    note "$c" "WARN $tag names a tree that declares $bad — a version pin misdescribes what it pins ($n declaration(s) compared)"
-  else note "$c" "ok   $tag == every one of $n declaration(s)"; fi
+    note "$c" WARN "$tag names a tree that declares $bad — a version pin misdescribes what it pins ($n declaration(s) compared)"
+  else note "$c" ok "$tag == every one of $n declaration(s)"; fi
 done
 
 echo "== half 5: currency — merged fixes the release does not contain (advisory, a FLOOR)"
@@ -455,10 +485,14 @@ echo "== half 5: currency — merged fixes the release does not contain (advisor
 # failure produces exactly that signal, so the instrument can announce a release that did not
 # happen (.github#11).
 for c in "${VERSIONED_REPOS[@]}"; do
+  # Review requirement 5: the four guards below report UNKNOWN, not WARN — each is
+  # a genuine transient request failure (gh never got a usable response), the same
+  # class half 1/2/3's UNKNOWN sites report, not the permanent "this value is
+  # legitimately absent" state half 4's WARN two sections up reports.
   if ! tag=$(gh api "repos/$ORG/$c/tags" --jq '.[0].name' 2>/dev/null); then
-    note "$c" "WARN cannot list tags — currency unknown"; continue
+    note "$c" UNKNOWN "cannot list tags — currency unknown this pass"; continue
   fi
-  [ -z "$tag" ] && { note "$c" "ok   no tags — nothing to be behind"; continue; }
+  [ -z "$tag" ] && { note "$c" ok "no tags — nothing to be behind"; continue; }
   # Guarded too, and my reason for exempting it was wrong in a way worth recording: I argued
   # that a failure here lands on the `tagdate` WARN below, so it could not print a clean
   # line. It can. `gh` writes the API ERROR BODY TO STDOUT — `{"message":"No commit found
@@ -474,30 +508,30 @@ for c in "${VERSIONED_REPOS[@]}"; do
   # The pipe is separate from the status read on purpose: `x=$(gh … | head -1)` takes
   # `head`'s status, which is 0 whatever `gh` did — the same trap as the `| awk` below.
   if ! sha=$(gh api "repos/$ORG/$c/tags" --jq ".[]|select(.name==\"$tag\")|.commit.sha" 2>/dev/null); then
-    note "$c" "WARN cannot resolve $tag to a commit — currency unknown"; continue
+    note "$c" UNKNOWN "cannot resolve $tag to a commit — currency unknown this pass"; continue
   fi
   sha="$(printf '%s\n' "$sha" | head -1)"
-  [ -z "$sha" ] && { note "$c" "WARN $tag resolves to no commit — currency unknown"; continue; }
+  [ -z "$sha" ] && { note "$c" WARN "$tag resolves to no commit — currency unknown"; continue; }
   # The release PR itself merges within a second of the tag commit, so the boundary is fuzzy
   # by about that much. It only ever admits the release commit, which is not a `fix(`.
   if ! tagdate=$(gh api "repos/$ORG/$c/commits/$sha" --jq '.commit.committer.date' 2>/dev/null); then
-    note "$c" "WARN cannot date $tag — currency unknown"; continue
+    note "$c" UNKNOWN "cannot date $tag — currency unknown this pass"; continue
   fi
   # Status AND emptiness: a call that succeeds but yields nothing is also not a date.
-  [ -z "$tagdate" ] && { note "$c" "WARN cannot date $tag — currency unknown"; continue; }
+  [ -z "$tagdate" ] && { note "$c" WARN "cannot date $tag — currency unknown"; continue; }
   # TSV out of jq, comparison in awk: ISO-8601 compares correctly as a string, and this keeps
   # the jq filter single-quoted instead of nesting shell quotes inside a jq regex.
   # Two steps, so the query's status is consulted before its emptiness is interpreted. As one
   # pipeline the assignment took awk's status and the failure vanished.
   if ! merged=$(gh api "repos/$ORG/$c/pulls?state=closed&per_page=100" --paginate \
                   --jq '.[]|select(.merged_at!=null)|"\(.merged_at)\t\(.number)\t\(.title)"' 2>/dev/null); then
-    note "$c" "WARN cannot list merged PRs — currency unknown"; continue
+    note "$c" UNKNOWN "cannot list merged PRs — currency unknown this pass"; continue
   fi
   debt=$(printf '%s\n' "$merged" \
          | awk -F'\t' -v d="$tagdate" '$1>d && $3 ~ /^fix[(:]/ {printf "#%s ", $2}')
   n=$(printf '%s' "$debt" | tr ' ' '\n' | grep -c '^#')
-  if [ "$n" = 0 ]; then note "$c" "ok   $tag carries every merged fix"
-  else note "$c" "DEBT $n unreleased fix(es) since $tag: ${debt% }"; fi
+  if [ "$n" = 0 ]; then note "$c" ok "$tag carries every merged fix"
+  else note "$c" DEBT "$n unreleased fix(es) since $tag: ${debt% }"; fi
 done
 
 if [ "$BOOT" = 1 ]; then
@@ -510,17 +544,23 @@ if [ "$BOOT" = 1 ]; then
     img="ghcr.io/barnett-studios/${c}:latest"
     # .github#15: a transient transport failure (TLS handshake timeout, connection
     # reset, i/o timeout — measured hitting this exact line at ~8% per request) is
-    # not evidence about the image at all. "manifest unknown"/"name unknown"/"not
-    # found" is a real "no such image" answer; denied/unauthorized/a literal 403 or
-    # 401 status is a real access rejection. Read the error rather than treat every
+    # not evidence about the image at all. "manifest unknown"/"name unknown" is a
+    # real "no such image" answer; denied/unauthorized/a literal 403 or 401 status
+    # is a real access rejection. Checked LAST, and in that order — not first:
+    # local-environment-failure must run before either, because "permission denied"
+    # talking to a local docker.sock contains "denied", and "docker: command not
+    # found" is a local failure too; both would otherwise read as the registry's
+    # own verdict (review requirement 3). Read the error rather than treat every
     # nonzero pull the same.
     if ! pull_out=$(docker pull "$img" 2>&1); then
-      if docker_pull_is_not_found "$pull_out"; then
-        note "$c" "FAIL anonymous docker pull: no such image/tag: $(printf '%s' "$pull_out" | tail -1)"; continue
+      if docker_pull_is_local_environment_failure "$pull_out"; then
+        note "$c" UNKNOWN "cannot pull $c at all — local docker environment unknown this pass: $(printf '%s' "$pull_out" | tail -1)"; continue
+      elif docker_pull_is_not_found "$pull_out"; then
+        note "$c" FAIL "anonymous docker pull: no such image/tag: $(printf '%s' "$pull_out" | tail -1)"; continue
       elif docker_pull_is_access_rejection "$pull_out"; then
-        note "$c" "FAIL anonymous docker pull rejected: $(printf '%s' "$pull_out" | tail -1)"; continue
+        note "$c" FAIL "anonymous docker pull rejected: $(printf '%s' "$pull_out" | tail -1)"; continue
       else
-        note "$c" "UNKNOWN cannot reach the registry to pull $c — reach unknown this pass: $(printf '%s' "$pull_out" | tail -1)"; continue
+        note "$c" UNKNOWN "cannot reach the registry to pull $c — reach unknown this pass: $(printf '%s' "$pull_out" | tail -1)"; continue
       fi
     fi
     if [ "$c" = cordon ]; then
@@ -528,8 +568,8 @@ if [ "$BOOT" = 1 ]; then
       # cordon-run.sh, documented as `git + python3 + build-essential` with no entrypoint.
       # Probing it with --help asserts a promise its README explicitly disclaims.
       docker run --rm "$img" python3 -c 'print(1)' >/dev/null 2>&1 \
-        && note "$c" "ok   runtime image has the documented python3" \
-        || { note "$c" "FAIL runtime image lacks the documented python3"; fail=1; }
+        && note "$c" ok "runtime image has the documented python3" \
+        || note "$c" FAIL "runtime image lacks the documented python3"
     else
       out=$(timeout 90 docker run --rm "$img" --help 2>&1); rc=$?
       # "Does it boot", not "does --help exit 0": a usage message on rc=2 is a booted binary
@@ -542,10 +582,10 @@ if [ "$BOOT" = 1 ]; then
       # is the last thing the boot probe should wave through. That instance did not reproduce
       # in four subsequent runs and was not filed; the misclassification is the real defect.
       case "$rc" in
-        124) note "$c" "FAIL HUNG — killed at the 90s deadline; re-run, and file it if it recurs"; fail=1 ;;
-        125|126|127) note "$c" "FAIL does not execute (rc=$rc): $(echo "$out"|head -1)"; fail=1 ;;
-        *) if [ -z "$out" ]; then note "$c" "FAIL ran but produced no output"; fail=1
-           else note "$c" "ok   executes (rc=$rc)"; fi ;;
+        124) note "$c" FAIL "HUNG — killed at the 90s deadline; re-run, and file it if it recurs" ;;
+        125|126|127) note "$c" FAIL "does not execute (rc=$rc): $(echo "$out"|head -1)" ;;
+        *) if [ -z "$out" ]; then note "$c" FAIL "ran but produced no output"
+           else note "$c" ok "executes (rc=$rc)"; fi ;;
       esac
     fi
   done

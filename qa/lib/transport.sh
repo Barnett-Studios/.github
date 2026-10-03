@@ -36,12 +36,29 @@ classify_http_status() { # $1 = three-digit HTTP status
   esac
 }
 
+# A LOCAL environment failure — docker missing, the daemon down, no permission on
+# the socket — is not an answer from the registry at all, and must be checked
+# before the two predicates below: "permission denied" (a local socket problem)
+# contains the bare word "denied", and "docker: command not found" contains the
+# bare phrase "not found" — both would otherwise misclassify as the registry's own
+# verdict. Review caught exactly this: a local failure reported as a real FAIL about
+# the artifact's public visibility, when it is actually "this runner can't even ask".
+docker_pull_is_local_environment_failure() { # $1 = combined stdout+stderr of a failed `docker pull`
+  case "$1" in
+    *"command not found"* | *"Cannot connect to the Docker daemon"* | *"docker.sock"* | *"is the docker daemon running"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # `docker pull`'s stderr on a *real* answer names it: "manifest unknown" / "name
-# unknown" / "not found" is the registry saying no such tag/repository exists — a
-# real FAIL, the same "not_found" outcome classify_http_status reports for a 404.
+# unknown" is the registry saying no such tag/repository exists — a real FAIL, the
+# same "not_found" outcome classify_http_status reports for a 404. Deliberately NOT
+# a bare `*"not found"*`: "docker: command not found" (the binary itself missing)
+# contains that exact phrase and is a local failure, not a registry answer — caught
+# by docker_pull_is_local_environment_failure, which callers must check first.
 docker_pull_is_not_found() { # $1 = combined stdout+stderr of a failed `docker pull`
   case "$1" in
-    *"manifest unknown"* | *"name unknown"* | *"not found"*) return 0 ;;
+    *"manifest unknown"* | *"name unknown"*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -50,7 +67,8 @@ docker_pull_is_not_found() { # $1 = combined stdout+stderr of a failed `docker p
 # denied/unauthorized verdict text, is an access rejection — also a real answer. Not
 # a bare `*403*`: review flagged that a bare three-digit match can fire on a URL, a
 # digest, or body text that happens to contain the digits coincidentally, with no
-# bearing on access at all.
+# bearing on access at all. Callers must check docker_pull_is_local_environment_failure
+# first — "permission denied" talking to the local docker.sock also contains "denied".
 docker_pull_is_access_rejection() { # $1 = combined stdout+stderr of a failed `docker pull`
   case "$1" in
     *"403 Forbidden"* | *"401 Unauthorized"* | *denied* | *unauthorized*) return 0 ;;
@@ -70,11 +88,25 @@ docker_pull_is_access_rejection() { # $1 = combined stdout+stderr of a failed `d
 # Returns nonzero only when there is no status line at all — gh/the network never
 # produced an HTTP response (DNS, connect, TLS, timeout): a transport failure, not a
 # status code of any kind.
+#
+# `--paginate` in "$@" repeats the whole status-line+headers+blank-line block once
+# PER PAGE — measured directly (a 21-commit repo at per_page=2 produced 21 such
+# blocks, each followed by that page's own filtered body, with no separating blank
+# line between one page's body and the next page's status line). The original cut
+# only the FIRST block and let every later page's headers flow straight into the
+# body as if they were content — invisible on every repo in this family today (none
+# has over 100 tags) and silently wrong the day one does. The awk script below strips
+# EVERY status-line+headers block, however many pages there are, not just the first.
 gh_api_raw() { # args passed straight to `gh api -i`
   local raw status
   raw=$(gh api -i "$@" 2>&1)
   status=$(printf '%s\n' "$raw" | head -1 | awk '/^HTTP\// {print $2}')
   [ -z "$status" ] && return 1
   printf '%s\n' "$status"
-  printf '%s\n' "$raw" | awk 'body{print} /^\r?$/{body=1}'
+  printf '%s\n' "$raw" | awk '
+    /^HTTP\// { inheader = 1; next }
+    inheader && /^\r?$/ { inheader = 0; next }
+    inheader { next }
+    { print }
+  '
 }
