@@ -327,64 +327,8 @@ for c in "${CRATES[@]}"; do
   else note "$c" ok "$max"; fi
 done
 
-# Every place the tag's tree declares THIS component's OWN version, as `path=version` lines.
-#
-# Half 4 used to read one file — VERSION, else Cargo.toml — and stop at the first hit, so a tree
-# that declares its version in four places was compared in one. cxpak v3.1.4 declared 3.1.3 in
-# three of its four and half 4 printed `ok` on every pass since the tag (.github#13). The stale
-# one was `ensure-cxpak`'s REQUIRED_VERSION, compared with exact equality, so the shipped plugin
-# rejected the binary the shipped release produced.
-#
-# Self-identifying by construction, which is what keeps this quiet on the other eight: a manifest
-# counts only when it NAMES this component. A vendored crate's Cargo.toml says
-# `name = "tree-sitter-scss"`, a seed fixture says `name = "test"`, a dependency pin names
-# something else — none of them can enter the set, so no denylist is needed and none can rot. The
-# census on .github#13 measured 26 benign version-like hits in cxpak's tree and 6 in corpus's;
-# this rule admits none of them.
-#
-# Returns non-zero if the tree could not be listed. A query that failed is not an empty result —
-# the rule half 5 states, applied to the enumeration half 4 now depends on.
-version_declarations() { # repo sha
-  local c="$1" sha="$2" paths path body v
-  paths=$(gh api "repos/$ORG/$c/git/trees/${sha}?recursive=1" --jq '.tree[]|select(.type=="blob")|.path' 2>/dev/null) || return 1
-  [ -z "$paths" ] && return 1
-  while IFS= read -r path; do
-    case "$(basename "$path")" in
-      VERSION|Cargo.toml|package.json|pyproject.toml|plugin.json|marketplace.json) ;;
-      *) case "$(basename "$path")" in *"$c"*) ;; *) continue ;; esac ;;
-    esac
-    body=$(gh api "repos/$ORG/$c/contents/${path}?ref=${sha}" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null) || continue
-    v=""
-    case "$(basename "$path")" in
-      VERSION) v=$(printf '%s' "$body" | tr -d '\n ') ;;
-      Cargo.toml|pyproject.toml)
-        # Only when the manifest names THIS component, so vendored and fixture manifests
-        # cannot contribute a version.
-        # Section-scoped: a `version = "1"` under [dependencies.foo] is a pin, not a
-        # declaration, and it sits at the start of its own line just like the real one.
-        # No temp file: a predictable path in a world-writable directory, which this estate
-        # argued against in baseplate#25 and which docs/standards/tooling-traps.md and
-        # dotclaude#159 both rule out. Command substitution does the same job with no file.
-        v=$(printf '%s' "$body" | awk -v c="$c" '
-          /^\[/{sec=$0}
-          sec ~ /^\[(package|project)\]/ && /^name *= *"/{gsub(/^name *= *"|".*$/,""); if ($0==c) named=1}
-          sec ~ /^\[(package|project)\]/ && /^version *= *"/{if (!seen) {gsub(/^version *= *"|".*$/,""); ver=$0; seen=1}}
-          END{if (named && seen) print ver}' 2>/dev/null) ;;
-      package.json|plugin.json)
-        v=$(printf '%s' "$body" | jq -r --arg c "$c" 'select(.name==$c)|.version // empty' 2>/dev/null) ;;
-      marketplace.json)
-        v=$(printf '%s' "$body" | jq -r --arg c "$c" '.plugins[]?|select(.name==$c)|.version // empty' 2>/dev/null) ;;
-      *)
-        # A resolver script pinning the binary it fetches — the shape that broke cxpak. Only
-        # considered for a file whose own name carries the component's, checked above.
-        v=$(printf '%s' "$body" | awk -F'"' '/^[A-Z_]*REQUIRED_VERSION *= *"/{print $2; exit}') ;;
-    esac
-    case "$v" in
-      [0-9]*.[0-9]*.[0-9]*) printf '%s=%s\n' "$path" "$v" ;;
-    esac
-  done <<< "$paths"
-  return 0
-}
+# shellcheck source=./lib/version_declarations.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/version_declarations.sh"
 
 echo "== half 4: the tag's own content agrees with the tag's name"
 # corpus#30's defect class, generalised: a tag named v0.2.0 whose tree declares 0.4.0. Reported

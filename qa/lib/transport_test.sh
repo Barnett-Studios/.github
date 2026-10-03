@@ -130,6 +130,24 @@ gh() {
         printf 'item-%s\n' "$page"
       done
       ;;
+    paginated_partial_failure)
+      # review requirement 1: cxpak has 38 tags today, already above gh's default
+      # 30-per-page — any --paginate tags call on it fetches 2 real pages. If page
+      # 2 fails partway (a transient 502), page 1's 200 was already printed before
+      # gh learned that, and gh's OWN overall exit is nonzero. The original bug:
+      # gh_api_raw never looked at that exit status at all, so it read page 1's
+      # 200 as if it were the whole, reliable answer.
+      printf 'HTTP/2.0 200 OK\r\n'
+      printf 'Content-Type: application/json\r\n'
+      printf 'Link: <...>; rel="next"\r\n'
+      printf '\r\n'
+      printf 'page1-item\n'
+      printf 'HTTP/2.0 502 Bad Gateway\r\n'
+      printf 'Content-Type: application/json\r\n'
+      printf '\r\n'
+      printf '{"message":"Bad Gateway"}'
+      return 1
+      ;;
   esac
 }
 
@@ -160,6 +178,14 @@ check "gh_api_raw status line on a paginated response" "$(printf '%s' "$raw" | h
 check "gh_api_raw concatenates all 3 pages' bodies" "$body" "$(printf 'item-1\nitem-2\nitem-3')"
 leaked=$(printf '%s' "$body" | grep -c "^HTTP/\|^Content-Type:\|^Link:" || true)
 check "no page's status line or headers leak into the concatenated body" "$leaked" 0
+
+# review requirement 1 (MAJOR): a partial pagination failure — page 1 succeeded
+# (200), page 2 failed (502), gh's own exit is nonzero — must be a transport
+# failure (UNKNOWN upstream), never "page 1's 200 is the answer". Live, not
+# hypothetical: cxpak has 38 tags, already above gh's 30-per-page default.
+GH_STUB_CASE=paginated_partial_failure
+gh_api_raw "repos/x/y/tags" --paginate >/dev/null
+check "a page-2 failure mid-pagination is a transport failure, not page 1's 200" "$?" 1
 
 unset -f gh
 

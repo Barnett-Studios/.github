@@ -97,12 +97,40 @@ docker_pull_is_access_rejection() { # $1 = combined stdout+stderr of a failed `d
 # body as if they were content — invisible on every repo in this family today (none
 # has over 100 tags) and silently wrong the day one does. The awk script below strips
 # EVERY status-line+headers block, however many pages there are, not just the first.
+#
+# A SECOND bug lived here too: this function never looked at gh's own exit status
+# at all. If page 1 of a paginated fetch succeeds (200) and a later page fails
+# partway (a transient 502), gh's overall exit is nonzero — but page 1's 200 was
+# already on stdout, so reading only the FIRST status line (as the original did)
+# reports a clean 200 over an incomplete, unreliable body. Live, not hypothetical:
+# cxpak carries 38 tags today, already above gh's 30-per-page default, so any
+# --paginate tags call on it fetches 2 real pages and is exposed to this.
+#
+# Single- vs multi-block responses are handled differently on purpose. A
+# single-block response (no pagination, or a 404 that never got far enough to
+# paginate) has gh's exit mirror that ONE status — nonzero on a 4xx/5xx too — and
+# that status IS the answer, classified by the caller via classify_http_status, not
+# here. Multiple blocks are only possible via --paginate; a fully successful
+# paginated fetch has gh exit 0 AND every block 2xx, so anything else (a nonzero
+# exit, or any block that isn't 2xx) means at least one page's request failed or
+# answered with something other than success, and the aggregate body may be
+# missing what that page would have contributed — a transport failure, not a
+# status to classify.
 gh_api_raw() { # args passed straight to `gh api -i`
-  local raw status
+  local raw rc statuses nblocks nbad first_status
   raw=$(gh api -i "$@" 2>&1)
-  status=$(printf '%s\n' "$raw" | head -1 | awk '/^HTTP\// {print $2}')
-  [ -z "$status" ] && return 1
-  printf '%s\n' "$status"
+  rc=$?
+  statuses=$(printf '%s\n' "$raw" | awk '/^HTTP\// {print $2}')
+  nblocks=$(printf '%s\n' "$statuses" | grep -c .)
+  [ "$nblocks" -eq 0 ] && return 1
+  first_status=$(printf '%s\n' "$statuses" | head -1)
+  if [ "$nblocks" -gt 1 ]; then
+    nbad=$(printf '%s\n' "$statuses" | grep -vc '^2..$')
+    if [ "$rc" -ne 0 ] || [ "$nbad" -gt 0 ]; then
+      return 1
+    fi
+  fi
+  printf '%s\n' "$first_status"
   printf '%s\n' "$raw" | awk '
     /^HTTP\// { inheader = 1; next }
     inheader && /^\r?$/ { inheader = 0; next }
