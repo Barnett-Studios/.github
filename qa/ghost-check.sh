@@ -468,11 +468,21 @@ for c in "${VERSIONED_REPOS[@]}"; do
   # Two steps, so the query's status is consulted before its emptiness is interpreted. As one
   # pipeline the assignment took awk's status and the failure vanished.
   if ! merged=$(gh api "repos/$ORG/$c/pulls?state=closed&per_page=100" --paginate \
-                  --jq '.[]|select(.merged_at!=null)|"\(.merged_at)\t\(.number)\t\(.title)"' 2>/dev/null); then
+                  --jq '.[]|select(.merged_at!=null)|"\(.merged_at)\t\(.number)\t\(.title)\t\(.merge_commit_sha)"' 2>/dev/null); then
     note "$c" UNKNOWN "cannot list merged PRs — currency unknown this pass"; continue
   fi
+  # .github#12: the date boundary alone misreads a PR whose merge commit IS the tag commit
+  # itself — a repo that tags directly on a `fix(` merge (cordon, slicr), with no separate
+  # release commit in between. `merged_at` trails `committer.date` by about a second, so
+  # `$1>d` is true for the tag's own fix, and it lands in `debt` despite being the very
+  # commit the tag names. Excluding any candidate whose merge_commit_sha equals the tag's own
+  # resolved $sha is exact for that shape and costs no extra API call (the column is already
+  # in this response). It does NOT widen to the general containment case — a fix merged
+  # between the last release-relevant commit and a LATER tagged commit would still misreport;
+  # that needs the ancestry check (`compare`) the issue's fuller suggestion describes.
   debt=$(printf '%s\n' "$merged" \
-         | awk -F'\t' -v d="$tagdate" '$1>d && $3 ~ /^fix[(:]/ {printf "#%s ", $2}')
+         | awk -F'\t' -v d="$tagdate" -v tagsha="$sha" \
+             '$1>d && $3 ~ /^fix[(:]/ && $4!=tagsha {printf "#%s ", $2}')
   n=$(printf '%s' "$debt" | tr ' ' '\n' | grep -c '^#')
   if [ "$n" = 0 ]; then note "$c" ok "$tag carries every merged fix"
   else note "$c" DEBT "$n unreleased fix(es) since $tag: ${debt% }"; fi
