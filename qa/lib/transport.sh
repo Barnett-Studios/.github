@@ -124,6 +124,12 @@ gh_api_raw() { # args passed straight to `gh api -i`
   nblocks=$(printf '%s\n' "$statuses" | grep -c .)
   [ "$nblocks" -eq 0 ] && return 1
   first_status=$(printf '%s\n' "$statuses" | head -1)
+  # A paginated call can lose a later page at the transport level (no HTTP/ line at
+  # all), leaving one 200 block; gh's exit is then the only signal that the body is
+  # partial. Single-page calls keep classifying 404/403 (gh exits nonzero on those).
+  case " $* " in
+    *" --paginate "*) [ "$rc" -ne 0 ] && return 1 ;;
+  esac
   if [ "$nblocks" -gt 1 ]; then
     nbad=$(printf '%s\n' "$statuses" | grep -vc '^2..$')
     if [ "$rc" -ne 0 ] || [ "$nbad" -gt 0 ]; then

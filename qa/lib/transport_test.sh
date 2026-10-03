@@ -148,6 +148,17 @@ gh() {
       printf '{"message":"Bad Gateway"}'
       return 1
       ;;
+    paginated_page2_transport_failure)
+      # page 1 answered 200, then page 2 died at the transport level (timeout or
+      # reset) with no HTTP/ status line at all: one status block, gh exit 1.
+      printf 'HTTP/2.0 200 OK\r\n'
+      printf 'Content-Type: application/json\r\n'
+      printf 'Link: <...>; rel="next"\r\n'
+      printf '\r\n'
+      printf 'page1-item\n'
+      printf 'error connecting to api.github.com\n' >&2
+      return 1
+      ;;
   esac
 }
 
@@ -186,6 +197,12 @@ check "no page's status line or headers leak into the concatenated body" "$leake
 GH_STUB_CASE=paginated_partial_failure
 gh_api_raw "repos/x/y/tags" --paginate >/dev/null
 check "a page-2 failure mid-pagination is a transport failure, not page 1's 200" "$?" 1
+
+# A paginated call whose later page failed with NO status line (transport-level)
+# leaves a single 200 block; gh's nonzero exit is the only signal, so it must count.
+GH_STUB_CASE=paginated_page2_transport_failure
+gh_api_raw "repos/x/y/tags" --paginate >/dev/null
+check "a paginated call with gh exit 1 and one 200 block is a transport failure" "$?" 1
 
 unset -f gh
 
