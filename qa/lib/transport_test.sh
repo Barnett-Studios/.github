@@ -204,6 +204,14 @@ GH_STUB_CASE=paginated_page2_transport_failure
 gh_api_raw "repos/x/y/tags" --paginate >/dev/null
 check "a paginated call with gh exit 1 and one 200 block is a transport failure" "$?" 1
 
+# ...but a paginated call whose ONLY response is a real 404 is still a real answer
+# (repo deleted/renamed): it must reach classification, not be demoted to UNKNOWN.
+GH_STUB_CASE=not_found
+raw=$(gh_api_raw "repos/x/y/tags" --paginate)
+rc=$?
+check "a paginated single 404 is still a response, not a transport failure" "$rc" 0
+check "a paginated single 404 keeps its status" "$(printf '%s' "$raw" | head -1)" 404
+
 unset -f gh
 
 exit "$fail"

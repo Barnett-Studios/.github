@@ -128,7 +128,12 @@ gh_api_raw() { # args passed straight to `gh api -i`
   # all), leaving one 200 block; gh's exit is then the only signal that the body is
   # partial. Single-page calls keep classifying 404/403 (gh exits nonzero on those).
   case " $* " in
-    *" --paginate "*) [ "$rc" -ne 0 ] && return 1 ;;
+    *" --paginate "*)
+      # Only when the lone answer was a success: a paginated single 404/403 is a
+      # real response and must still reach classification.
+      if [ "$rc" -ne 0 ] && [ "$nblocks" -eq 1 ] && [ "$(classify_http_status "$first_status")" = ok ]; then
+        return 1
+      fi ;;
   esac
   if [ "$nblocks" -gt 1 ]; then
     nbad=$(printf '%s\n' "$statuses" | grep -vc '^2..$')
